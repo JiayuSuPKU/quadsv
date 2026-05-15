@@ -1,0 +1,180 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quadsv"
+dynamic = ["version"]
+description = "Consistent and scalable spatial pattern detection via quadratic forms."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "BSD-3-Clause"
+authors = [
+    {name = "Jiayu Su"}
+]
+maintainers = [
+    {name = "Jiayu Su"}
+]
+keywords = [
+    "spatial statistics",
+    "pattern detection",
+    "SVG detection",
+    "kernel methods",
+    "hypothesis testing",
+    "spatial transcriptomics",
+    "single-cell",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Natural Language :: English",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+dependencies = [
+    # scanpy transitively pulls anndata, numpy, scipy, scikit-learn, and
+    # pandas — we track scanpy's own floor rather than restate them.
+    "scanpy>=1.9",
+    "spatialdata>=0.1",   # FFT rasterization + SpatialData IO
+    "finufft>=2.2",       # NUFFT backend
+    "joblib>=1.2",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+# `dev` is the superset for local development: includes everything needed to
+# run tests, lint, build, and iterate in notebooks.
+dev = [
+    # Testing
+    "pytest>=7.0",
+    "pytest-cov>=3.0",
+    "pytest-xdist>=3.0",
+    # Linting / formatting
+    "black>=22.0",
+    "ruff>=0.1",
+    # Packaging
+    "build>=1.0",
+    "twine>=4.0",
+    # Interactive / plotting
+    "jupyter>=1.0",
+    "matplotlib>=3.5",
+    # GO analysis
+    "gprofiler-official>=1.0",
+]
+# `docs` builds the Sphinx HTML site. Napoleon ships with Sphinx so the
+# standalone `sphinxcontrib-napoleon` package is not needed.
+docs = [
+    "sphinx>=5.0",
+    "sphinx-book-theme>=1.1",
+    "sphinx-autoapi>=3.0",
+    "sphinx-autodoc-typehints>=1.19",
+    "sphinx-design>=0.5",                 # ``.. dropdown::`` directives
+    "myst-parser>=0.18",
+    "sphinx-autobuild>=2021.3.14",
+    "tomli>=2.0;python_version<'3.11'",   # tomllib fallback in docs/conf.py
+]
+
+[project.urls]
+Documentation = "https://equivsvt.readthedocs.io/"
+Repository = "https://github.com/JiayuSuPKU/EquivSVT"
+"Bug Tracker" = "https://github.com/JiayuSuPKU/EquivSVT/issues"
+"Source Code" = "https://github.com/JiayuSuPKU/EquivSVT"
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+  | docs
+)/
+'''
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+lint.select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "C",      # flake8-comprehensions
+    "B",      # flake8-bugbear
+    "UP",     # pyupgrade
+]
+lint.ignore = [
+    "E501",   # line too long (handled by black)
+    "B008",   # do not perform function calls in argument defaults,
+    "E741",   # ambiguous variable name,
+    "E402",   # module level import not at top of file
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "E402"]
+"tests/**" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "--strict-markers -v -p no:npe2 -p no:napari"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+]
+
+[tool.coverage.run]
+source = ["src/quadsv"]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "if typing.TYPE_CHECKING:",
+]
+precision = 2
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Derive the package version from git tags. On a clean release commit
+# tagged ``vX.Y.Z`` the version is ``X.Y.Z``; between tags it is
+# ``X.Y.(Z+1).devN+g<sha>[.dYYYYMMDD]`` per PEP 440. On install / build
+# the resolved version is written to ``src/quadsv/_version.py`` so the
+# runtime ``__version__`` lookup works without git (sdist, wheel, shallow
+# clones). ``fallback_version`` is used only when both git AND the
+# generated file are missing — keep it in sync with the last release.
+[tool.setuptools_scm]
+version_file = "src/quadsv/_version.py"
+fallback_version = "0.1.1"
