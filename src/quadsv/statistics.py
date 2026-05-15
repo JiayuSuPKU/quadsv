@@ -480,7 +480,7 @@ def _hutchinson_cumulants(
 
     *FFTKernel* — **full spectrum always, all four cumulants analytic**
         ``c_p = Σ_k λ̃(k)^p`` is computed analytically using the ``n`` Fourier
-        modes (``O(n)``) cached from :meth:`~quadsv.fft.FFTKernel.eigenvalues`.
+        modes (``O(n)``) cached from :meth:`~quadsv.kernels.fft.FFTKernel.eigenvalues`.
 
     *MatrixKernel / NUFFTKernel — ``use_analytic_c12=True``* (default)
         ``c_1`` from :meth:`trace`, ``c_2`` from :meth:`square_trace`

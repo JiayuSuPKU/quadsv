@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "quadsv"
 dynamic = ["version"]
-description = "Consistent and scalable spatial pattern detection via quadratic forms."
+description = "Consistent and scalable spatial pattern detection and comparison via quadratic forms."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "BSD-3-Clause"
@@ -86,10 +86,10 @@ docs = [
 ]
 
 [project.urls]
-Documentation = "https://equivsvt.readthedocs.io/"
-Repository = "https://github.com/JiayuSuPKU/EquivSVT"
-"Bug Tracker" = "https://github.com/JiayuSuPKU/EquivSVT/issues"
-"Source Code" = "https://github.com/JiayuSuPKU/EquivSVT"
+Documentation = "https://quadsv.readthedocs.io/"
+Repository = "https://github.com/JiayuSuPKU/quadsv"
+"Bug Tracker" = "https://github.com/JiayuSuPKU/quadsv/issues"
+"Source Code" = "https://github.com/JiayuSuPKU/quadsv"
 
 [tool.black]
 line-length = 100

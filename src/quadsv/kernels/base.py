@@ -39,8 +39,8 @@ class Kernel(ABC):
     Concrete backends:
 
     - :class:`MatrixKernel` — explicit n×n kernel or its sparse precision matrix.
-    - :class:`quadsv.fft.FFTKernel` — grid kernel via its eigenvalue spectrum.
-    - :class:`quadsv.nufft.NUFFTKernel` — irregular-point kernel evaluated through a
+    - :class:`quadsv.kernels.fft.FFTKernel` — grid kernel via its eigenvalue spectrum.
+    - :class:`quadsv.kernels.nufft.NUFFTKernel` — irregular-point kernel evaluated through a
       type-1 / type-2 NUFFT round-trip.
 
     Required interface

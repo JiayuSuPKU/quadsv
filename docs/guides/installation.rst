@@ -21,8 +21,8 @@ From source
 
 .. code-block:: bash
 
-   git clone https://github.com/JiayuSuPKU/EquivSVT.git
-   cd EquivSVT
+   git clone https://github.com/JiayuSuPKU/quadsv.git
+   cd quadsv
    pip install -e '.[dev,docs]'
 
 
@@ -52,7 +52,7 @@ Verify the install
    print(quadsv.__version__)
    print(sorted(quadsv.__all__))
 
-You should see 14 public names organised into four layers (see
+You should see 17 public names organised into four layers (see
 :doc:`/guides/quickstart` for what each layer does). The top-level
 package is the user-facing surface. The canonical submodule paths
 (``quadsv.kernels.*``, ``quadsv.detectors.*``,

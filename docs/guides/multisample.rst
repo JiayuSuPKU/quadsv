@@ -101,6 +101,36 @@ Both run through :func:`quadsv.comparators.multisample.compare_two_groups`
 flip ``statistic="log_l2"`` ↔ ``statistic="welch_t_cauchy"`` to compare on
 the same fitted spectra.
 
+Minimal pattern-comparison call
+-------------------------------
+
+If every sample is an :class:`anndata.AnnData` with shared
+``var_names`` and coordinates in ``obsm["spatial"]``, the
+:func:`~quadsv.Comparator` factory is enough:
+
+.. code-block:: python
+
+   import numpy as np
+   from quadsv import Comparator
+
+   design = np.array([0, 0, 0, 1, 1, 1])  # one label per sample
+   cmp = (
+       Comparator(samples)
+       .compute_spectra(n_jobs=4)
+       .normalize_background()
+   )
+   pattern_hits = cmp.test_diff_freq(
+       design,
+       statistic="log_l2",
+       normalize_shape=True,
+   )
+   expression_hits = cmp.test_diff_expr(design)
+
+``pattern_hits`` asks whether the spatial layout differs between
+groups. ``expression_hits`` asks whether the sample-level means differ.
+Running both keeps pattern-only changes separate from ordinary
+differential expression.
+
 
 Picking a class
 ---------------

@@ -10,12 +10,12 @@ A 5-minute tour. ``quadsv`` does three things:
 3. **Compare slides** with :func:`~quadsv.Comparator`. Do two
    groups of samples differ in spatial pattern?
 
-The kernel you pass to the test decides what kind of spatial
-structure earns a high score. CAR and Matérn kernels reward smooth
-gradients; a graph-Laplacian kernel rewards sharp differences
-between neighbouring spots. See :doc:`/guides/kernels`.
-
-This page covers (1) and (2). For (3), see :doc:`/guides/multisample`.
+The kernel you pass to the single-sample tests decides what kind of
+spatial structure earns a high score. CAR and Matérn kernels reward
+smooth gradients; a graph-Laplacian kernel rewards sharp differences
+between neighbouring spots. See :doc:`/guides/kernels`. For
+cross-sample comparisons, ``quadsv`` compares frequency-domain
+pattern spectra so samples do not need to be spatially registered.
 
 
 The four layers
@@ -261,6 +261,84 @@ Code:
        min_count=10,
    )
    results = detector.compute_qstat(n_jobs=4, return_pval=True)
+
+
+Compare Patterns Across Samples
+-------------------------------
+
+The :func:`~quadsv.Comparator` factory picks
+:class:`~quadsv.ComparatorIrregular` for a list of
+:class:`anndata.AnnData` samples and :class:`~quadsv.ComparatorGrid`
+for a list of :class:`spatialdata.SpatialData` samples. The
+pattern-comparison path is alignment-free: each sample is converted
+to per-gene spatial power spectra, spectra are reduced to common
+radial frequency bins, and per-gene group differences are tested
+with :meth:`~quadsv.ComparatorIrregular.test_diff_freq`.
+
+For AnnData samples:
+
+.. code-block:: python
+
+   import anndata as ad
+   import numpy as np
+   from quadsv import Comparator
+
+   paths = [
+       "control_1.h5ad",
+       "control_2.h5ad",
+       "control_3.h5ad",
+       "case_1.h5ad",
+       "case_2.h5ad",
+       "case_3.h5ad",
+   ]
+   samples = [ad.read_h5ad(path) for path in paths]
+   design = np.array([0, 0, 0, 1, 1, 1])  # 1-D labels -> binary contrast
+
+   cmp = (
+       Comparator(samples)
+       .compute_spectra(n_jobs=4)
+       .normalize_background()
+   )
+
+   pattern_hits = cmp.test_diff_freq(
+       design,
+       statistic="log_l2",
+       normalize_shape=True,
+   )
+   expression_hits = cmp.test_diff_expr(design)
+
+``pattern_hits`` is sorted by evidence of differential spatial
+pattern and has columns ``Feature``, ``Statistic``, ``P_value``, and
+``P_adj``. ``normalize_shape=True`` isolates redistribution of power
+across radial frequencies from overall pattern amplitude. The
+companion ``expression_hits`` table tests the DC component, so a gene
+can be pattern-only, expression-only, or both.
+
+For :class:`spatialdata.SpatialData` grids, keep the same
+``Comparator`` factory and pass the grid rasterization keys:
+
+.. code-block:: python
+
+   import numpy as np
+   import spatialdata as sd
+   from quadsv import Comparator
+
+   samples = [sd.read_zarr(path) for path in zarr_paths]
+   design = np.array([0, 0, 0, 1, 1, 1])
+
+   cmp = Comparator(
+       samples,
+       bins="square_008um",
+       table_name="square_008um",
+       col_key="array_col",
+       row_key="array_row",
+   ).compute_spectra().normalize_background()
+
+   pattern_hits = cmp.test_diff_freq(design, statistic="log_l2")
+
+See :doc:`/guides/multisample` for covariate residualisation,
+permutation nulls, GLM contrasts, unit scaling, and Visium-specific
+notes.
 
 
 Next steps

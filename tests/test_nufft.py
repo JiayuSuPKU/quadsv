@@ -359,7 +359,7 @@ class TestNUFFTTwoPathsAgree:
     def test_trace_takes_no_kwargs(self):
         """``NUFFTKernel.trace`` / ``square_trace`` are closed-form on the
         FFT spectrum — no probes, no options. The signatures match
-        :class:`quadsv.fft.FFTKernel` (also argument-free). Only
+        :class:`quadsv.kernels.fft.FFTKernel` (also argument-free). Only
         :class:`quadsv.kernels.MatrixKernelBase` exposes an ``n_probes``
         kwarg, and only because its precision-stored path runs a
         Rademacher-through-LU Hutchinson estimator.

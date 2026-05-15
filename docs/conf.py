@@ -138,7 +138,7 @@ html_theme_options = {
     "search_bar_text": "Search...",
     "show_toc_level": 4,
     "navigation_depth": 4,
-    "repository_url": "https://github.com/JiayuSuPKU/EquivSVT",
+    "repository_url": "https://github.com/JiayuSuPKU/quadsv",
     "use_repository_button": True,
 }
 

@@ -1,21 +1,22 @@
-# quadsv: Consistent and scalable spatial pattern detection
+# quadsv: Consistent and scalable spatial pattern detection and comparison
 
-Detect spatial patterns in omics data via kernel-based hypothesis tests for spatial variability (*Q-tests*) and for co-expression (*R-tests*).
+Detect spatial patterns in omics data via kernel-based hypothesis tests for spatial variability (*Q-tests*) and co-expression (*R-tests*), then compare spatial pattern spectra across samples or conditions.
 
 **Key features:**
 - **Reliable**: CAR kernel eliminates false negatives from Moran's I spectral cancellation  
 - **Scalable**: Implicit sparse solvers and FFT acceleration handle millions of spots  
 - **Universal**: Works with Visium, Visium HD, MERFISH, lineage trees, any spatial/graph data  
 - **Integrated**: Native `AnnData` and `SpatialData` support
+- **Comparative**: Alignment-free cross-sample pattern comparison with FFT/NUFFT spectra
 
 ## Installation
 
 ```bash
 pip install quadsv  # From PyPI
 # OR (latest dev version)
-pip install git+https://github.com/JiayuSuPKU/EquivSVT.git#egg=quadsv
+pip install git+https://github.com/JiayuSuPKU/quadsv.git#egg=quadsv
 # OR (for development)
-git clone https://github.com/JiayuSuPKU/EquivSVT.git && cd EquivSVT && pip install -e .
+git clone https://github.com/JiayuSuPKU/quadsv.git && cd quadsv && pip install -e .
 ```
 
 ## Usage
@@ -24,15 +25,14 @@ git clone https://github.com/JiayuSuPKU/EquivSVT.git && cd EquivSVT && pip insta
 
 ```python
 import numpy as np
-from quadsv.kernels import SpatialKernel
-from quadsv.statistics import spatial_q_test
+from quadsv import MatrixKernel, spatial_q_test
 
 # simulate coordinates and gene expression
 coords = np.random.randn(500, 2)
 gene_expression = np.random.randn(500)
 
 # build CAR kernel and run Q-test
-kernel = SpatialKernel.from_coordinates(coords, method='car', k_neighbors=15, rho=0.9)
+kernel = MatrixKernel.from_coordinates(coords, method='car', k_neighbors=15, rho=0.9)
 Q, pval = spatial_q_test(gene_expression, kernel)
 print(f"Q-statistic: {Q:.4f}, p-value: {pval:.4e}")
 ```
@@ -40,7 +40,7 @@ print(f"Q-statistic: {Q:.4f}, p-value: {pval:.4e}")
 ### R-test: Spatial co-expression
 
 ```python
-from quadsv.statistics import spatial_r_test
+from quadsv import spatial_r_test
 
 # run R-test with the same kernel
 gene1, gene2 = np.random.randn(500), np.random.randn(500)
@@ -52,7 +52,7 @@ print(f"R-statistic: {R:.4f}, p-value: {pval:.4e}")
 
 ```python
 import numpy as np
-from quadsv.fft import FFTKernel, spatial_q_test_fft, spatial_r_test_fft
+from quadsv import FFTKernel, spatial_q_test, spatial_r_test
 
 # For grid data (e.g., 1000x1000 Visium HD)
 kernel_fft = FFTKernel(shape=(1000, 1000), method='car', rho=0.9)
@@ -61,13 +61,13 @@ kernel_fft = FFTKernel(shape=(1000, 1000), method='car', rho=0.9)
 gene_grid = np.random.randn(1000, 1000)
 
 # run FFT-based Q-test
-Q_fft, pval_fft = spatial_q_test_fft(gene_grid, kernel_fft)
+Q_fft, pval_fft = spatial_q_test(gene_grid, kernel_fft)
 print(f"FFT Q-test: Q={Q_fft:.4f}, p-value={pval_fft:.4e}")
 
 # run FFT-based R-test
 gene1_grid = np.random.randn(1000, 1000)
 gene2_grid = np.random.randn(1000, 1000)
-R_fft, pval_fft = spatial_r_test_fft(gene1_grid, gene2_grid, kernel_fft)
+R_fft, pval_fft = spatial_r_test(gene1_grid, gene2_grid, kernel_fft)
 print(f"FFT R-test: R={R_fft:.4f}, p-value={pval_fft:.4e}")
 ```
 
@@ -77,20 +77,19 @@ print(f"FFT R-test: R={R_fft:.4f}, p-value={pval_fft:.4e}")
 
 ```python
 import anndata as ad
-from quadsv.detector import PatternDetector
+from quadsv import Detector
 
 adata = ad.read_h5ad("spatial_data.h5ad")
-detector = PatternDetector(adata, min_cells_frac=0.05)
-
-# build kernel from spatial coordinates
-detector.build_kernel_from_coordinates(adata.obsm['spatial'], method='car', rho=0.9, k_neighbors=4)
-
-# alternatively, from a precomputed graph adjacency
-adata.obsp['W'] = ...  # Precomputed graph adjacency matrix (usually sparse)
-detector.build_kernel_from_obsp(key='W', is_distance=False, method='car', rho=0.9)
+detector = Detector(
+    adata,
+    kernel_method='car',
+    backend='matrix',
+    rho=0.9,
+    k_neighbors=4,
+).setup_data(adata, obsm_key='spatial', min_cells_frac=0.05)
 
 # Compute Q-statistics and p-values genome-wide
-q_results_df = detector.compute_qstat(source='var', features = None, return_pval = True)
+q_results_df = detector.compute_qstat(source='var', features=None, return_pval=True)
 
 # Returns DataFrame with columns: [Q, P_value, P_adj, Z_score]
 significant_genes = q_results_df[q_results_df['P_adj'] < 0.05]
@@ -98,8 +97,13 @@ print(f"Found {len(significant_genes)} spatially variable genes")
 
 # Select top 1000 SVGs for pairwise R-test
 top_genes = significant_genes.sort_values('Q', ascending=False).head(1000).index.tolist()
-r_results_df = detector.compute_rstat(source='var', features_x=top_genes, features_y=None, return_pval=True)
-# Returns DataFrame with columns: [Gene_X, Gene_Y, R, P_value, P_adj, Z_score]
+r_results_df = detector.compute_rstat(
+    source='var',
+    features_x=top_genes,
+    features_y=None,
+    return_pval=True,
+)
+# Returns DataFrame with columns: [Feature_1, Feature_2, R, P_value, P_adj, Z_score]
 significant_pairs = r_results_df[r_results_df['P_adj'] < 0.05]
 print(f"Found {len(significant_pairs)} spatially co-expressed gene pairs")
 ```
@@ -108,19 +112,54 @@ print(f"Found {len(significant_pairs)} spatially co-expressed gene pairs")
 
 ```python
 import spatialdata as sd
-from quadsv.detector_fft import PatternDetectorFFT
+from quadsv import Detector
 
 sdata = sd.read_zarr("visium_hd.zarr/")
-detector = PatternDetectorFFT(sdata, kernel_method='car', rho=0.9, topology='square')
-
+detector = Detector(sdata, kernel_method='car', rho=0.9, topology='square').setup_data(
+    sdata,
+    bins='Visium_HD_bin',
+    table_name='table',
+    col_key='array_col',
+    row_key='array_row',
+)
 results = detector.compute_qstat(
-    bins=['Visium_HD_bin'],
-    table_name=['table'],
     n_jobs=4, workers=2, return_pval=True
 )
 ```
 
-**Full tutorials:** [See docs/quickstart.rst](docs/quickstart.rst) and test suite examples.
+#### Cross-sample spatial pattern comparison
+
+```python
+import anndata as ad
+import numpy as np
+from quadsv import Comparator
+
+sample_paths = [
+    "control_1.h5ad",
+    "control_2.h5ad",
+    "control_3.h5ad",
+    "case_1.h5ad",
+    "case_2.h5ad",
+    "case_3.h5ad",
+]
+samples = [ad.read_h5ad(path) for path in sample_paths]
+groups = np.array([0, 0, 0, 1, 1, 1])  # 1-D labels: control vs case
+
+cmp = (
+    Comparator(samples)
+    .compute_spectra(n_jobs=4)
+    .normalize_background()
+)
+
+# Pattern-level difference: compares radial power spectra, not total expression.
+pattern_hits = cmp.test_diff_freq(groups, statistic='log_l2', normalize_shape=True)
+# Companion expression-level difference on the DC component.
+expression_hits = cmp.test_diff_expr(groups)
+```
+
+`pattern_hits` returns per-gene columns `[Feature, Statistic, P_value, P_adj]`. Use `ComparatorGrid` or the same `Comparator(...)` factory with `SpatialData` samples for regular rasterized grids.
+
+**Full tutorials:** [See docs/guides/quickstart.rst](docs/guides/quickstart.rst), [docs/guides/multisample.rst](docs/guides/multisample.rst), and test suite examples.
 
 ## Kernel Methods
 
@@ -142,7 +181,7 @@ pytest tests/test_tutorials.py -v       # Run tutorial examples
 pip install -e ".[dev,docs]"            # Install dev + docs dependencies
 ```
 
-**Documentation:** [ReadTheDocs](https://equivsvt.readthedocs.io/)
+**Documentation:** [ReadTheDocs](https://quadsv.readthedocs.io/)
 
 ## References
 
@@ -152,5 +191,5 @@ Su, Jiayu, et al. "On the consistent and scalable detection of spatial patterns.
 ## License & Support
 
 - **License:** BSD-3-Clause - see [LICENSE](LICENSE)  
-- **Issues:** [GitHub Issues](https://github.com/JiayuSuPKU/EquivSVT/issues)  
-- **Docs:** [ReadTheDocs](https://equivsvt.readthedocs.io/)
+- **Issues:** [GitHub Issues](https://github.com/JiayuSuPKU/quadsv/issues)
+- **Docs:** [ReadTheDocs](https://quadsv.readthedocs.io/)

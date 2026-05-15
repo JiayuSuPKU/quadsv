@@ -100,7 +100,7 @@ FAQ
    to :meth:`quadsv.MatrixKernel.from_coordinates` the same way you
    would for 2-D. The FFT and NUFFT backends are 2-D only for now.
    If you need 3-D Fourier acceleration, please open a feature
-   request on `GitHub <https://github.com/JiayuSuPKU/EquivSVT/issues>`_.
+   request on `GitHub <https://github.com/JiayuSuPKU/quadsv/issues>`_.
 
 
 Further help
@@ -109,5 +109,5 @@ Further help
 - :doc:`/guides/quickstart` for the getting-started tour.
 - :doc:`/guides/theory` for derivations.
 - :doc:`/autoapi/quadsv/index` for the API reference.
-- `GitHub Issues <https://github.com/JiayuSuPKU/EquivSVT/issues>`_
+- `GitHub Issues <https://github.com/JiayuSuPKU/quadsv/issues>`_
   for bug reports and feature requests.

@@ -29,11 +29,11 @@ Welcome
 
    changelog
 
-`quadsv <https://github.com/JiayuSuPKU/EquivSVT>`_ is a Python library
-for **detecting spatial patterns in omics data**. With it you can
-score how much each gene's expression depends on space, find gene
-pairs that share a spatial pattern, and compare pattern shapes across
-slides, all through a single statistical framework.
+`quadsv <https://github.com/JiayuSuPKU/quadsv>`_ is a Python library
+for **detecting** and **comparing** spatial patterns in omics data. 
+With it you can score how much each gene's expression depends on space, find gene
+pairs that share a spatial pattern, and compare patterns across multiple samples 
+without alignment, all through a single statistical framework.
 
 The kernel you pass to the test decides what kind of spatial structure
 counts. A CAR or Matérn kernel rewards smooth gradients across the
@@ -56,6 +56,8 @@ Key features
   and precomputed graphs.
 - **Integrated.** Reads :class:`anndata.AnnData` and
   :class:`spatialdata.SpatialData` directly.
+- **Comparative.** Ranks genes by cross-sample spatial-pattern
+  differences using alignment-free FFT / NUFFT spectra.
 
 
 Quick example
@@ -113,4 +115,4 @@ Reporting issues
 ----------------
 
 Please open a ticket on the
-`GitHub Issues page <https://github.com/JiayuSuPKU/EquivSVT/issues>`_.
+`GitHub Issues page <https://github.com/JiayuSuPKU/quadsv/issues>`_.

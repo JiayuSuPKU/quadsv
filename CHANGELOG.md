@@ -256,8 +256,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Core kernel methods: Gaussian, Matérn, CAR, Graph Laplacian, Moran's I
 - Implicit mode for scalable large-N computation (N > 5000)
 - FFT acceleration for regular grid data (Visium HD)
-- PatternDetector for AnnData integration (genome-wide SVG detection)
-- PatternDetectorFFT for large-scale Visium HD analysis
+- `DetectorIrregular` for AnnData integration (genome-wide SVG detection)
+- `DetectorGrid` for large-scale Visium HD analysis
 - Null approximation methods: CLT, Welch/Satterthwaite, Liu
 - Comprehensive test suite (unit + integration tests)
 - Tutorial test cases demonstrating all major workflows
