@@ -181,7 +181,34 @@ pytest tests/test_tutorials.py -v       # Run tutorial examples
 pip install -e ".[dev,docs]"            # Install dev + docs dependencies
 ```
 
-**Documentation:** [ReadTheDocs](https://quadsv.readthedocs.io/)
+### Troubleshooting: pytest segfault or Numba cache error on Apple Silicon
+
+On macOS arm64, failures in an existing conda environment can come from native
+scientific dependencies loaded before `quadsv` code runs. One known trigger is
+`spatialdata` importing `xrspatial`, which decorates interpolation helpers with
+`numba.njit(cache=True)`. 
+
+When a Numba issue occurs, rerun pytest with Numba JIT disabled for local testing:
+
+```bash
+NUMBA_DISABLE_JIT=1 python -m pytest -q
+```
+
+If tests still segfault after the import issue is bypassed, check the environment for
+multiple OpenMP runtimes. A common bad state is loading both conda's
+`$CONDA_PREFIX/lib/libomp.dylib` through OpenBLAS and a vendored `libomp.dylib`
+from a PyPI wheel such as scikit-learn. To confirm whether the failure is environment-specific, 
+validate the package from a clean conda environment:
+
+```bash
+conda create -n quadsv-test -c conda-forge python=3.12 pip -y
+conda activate quadsv-test
+python -m pip install -e ".[dev]"
+python -m pytest -q
+```
+
+### Documentation
+[ReadTheDocs](https://quadsv.readthedocs.io/)
 
 ## References
 
