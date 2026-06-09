@@ -299,6 +299,225 @@ def radial_bin_spectrum(
     return out.reshape(*leading, out.shape[-1])
 
 
+def stream_radial_features(
+    spectrum_chunk_fn: Any,
+    n_genes: int,
+    grid_shape: tuple[int, int],
+    *,
+    chunk_size: int,
+    n_bins: int,
+    fft_solver: str,
+    spacing: tuple[float, float] | None,
+    edges: np.ndarray | None,
+    pbar: Any = None,
+) -> np.ndarray:
+    """Stream a sample's spectrum gene-chunk-by-gene-chunk into radial features.
+
+    Computes the radial-binned ``(n_genes, K)`` feature matrix without ever
+    holding the full ``(n_genes, ny, n_kx)`` 2D spectrum: for each gene-chunk,
+    ``spectrum_chunk_fn(start, stop)`` returns that chunk's 2D power spectrum
+    ``(stop-start, ny, n_kx)``, which is immediately radial-binned and the dense
+    2D block discarded. Peak memory is therefore ``O(chunk · ny · nx)``.
+
+    Parameters
+    ----------
+    spectrum_chunk_fn : callable
+        ``(start, stop) -> np.ndarray`` of shape ``(stop-start, ny, n_kx)``.
+    n_genes : int
+        Total genes (features) in the sample.
+    grid_shape : tuple[int, int]
+        ``(ny, nx)`` of the rasterized image.
+    chunk_size : int
+        Genes per chunk.
+    n_bins, fft_solver, spacing, edges
+        Forwarded to :func:`radial_bin_spectrum`.
+    pbar : tqdm, optional
+        Progress bar; ``.update(1)`` is called once per chunk.
+
+    Returns
+    -------
+    np.ndarray
+        Radial features of shape ``(n_genes, K)``.
+    """
+    parts: list[np.ndarray] = []
+    for start in range(0, n_genes, chunk_size):
+        stop = min(start + chunk_size, n_genes)
+        spec_chunk = spectrum_chunk_fn(start, stop)
+        parts.append(
+            radial_bin_spectrum(
+                spec_chunk,
+                grid_shape=grid_shape,
+                n_bins=n_bins,
+                fft_solver=fft_solver,
+                spacing=spacing,
+                edges=edges,
+            )
+        )
+        del spec_chunk
+        if pbar is not None:
+            pbar.update(1)
+    return np.concatenate(parts, axis=0)
+
+
+def stream_geomean_landmark(
+    spectrum_chunk_fn: Any,
+    n_genes: int,
+    grid_shape: tuple[int, int],
+    *,
+    chunk_size: int,
+    gene_subset: np.ndarray | None = None,
+    eps: float = 1e-12,
+    pbar: Any = None,
+) -> np.ndarray:
+    """Stream a sample's per-(k) **geometric-mean** spectrum as a single landmark.
+
+    Accumulates the across-gene mean of ``log(power + eps)`` one gene-chunk at a
+    time, then exponentiates — yielding ``(1, ny, n_kx)``. The geomean is the
+    amplitude-invariant consensus orientation template (per-gene brightness
+    becomes an additive log constant that cannot move the angular argmax),
+    mirroring :func:`normalize_background`'s cross-gene geometric mean. Peak
+    memory is ``O(chunk · ny · nx)`` plus one ``(ny, n_kx)`` accumulator — the
+    full ``(n_genes, ny, n_kx)`` stack is never held.
+
+    Parameters
+    ----------
+    spectrum_chunk_fn : callable
+        ``(start, stop) -> (stop-start, ny, n_kx)`` power-spectrum chunk.
+    n_genes, grid_shape, chunk_size
+        As in :func:`stream_radial_features`.
+    gene_subset : np.ndarray, optional
+        If given, the geometric mean is taken over only these gene indices
+        (into ``0..n_genes-1``), chunked so the subset is never fully cached.
+        Used to build a single geomean landmark from an explicit landmark-gene
+        set when caching those genes' full 2D spectra would exceed budget.
+        ``None`` (default) averages over all ``n_genes``.
+    eps : float, default 1e-12
+        Floor added before the log (keeps zeros finite).
+    pbar : tqdm, optional
+        Progress bar; ``.update(1)`` per chunk.
+
+    Returns
+    -------
+    np.ndarray
+        ``(1, ny, n_kx)`` geometric-mean landmark spectrum.
+    """
+    log_sum: np.ndarray | None = None
+    if gene_subset is None:
+        indices: Any = range(0, n_genes, chunk_size)
+        count = n_genes
+
+        def _chunk(start: int) -> np.ndarray:
+            return spectrum_chunk_fn(start, min(start + chunk_size, n_genes))
+
+    else:
+        subset = np.asarray(gene_subset, dtype=int)
+        count = int(subset.size)
+        indices = range(0, count, chunk_size)
+
+        def _chunk(start: int) -> np.ndarray:
+            cols = subset[start : min(start + chunk_size, count)]
+            # Materialise this slice of the subset gene-by-gene (each is one
+            # spectrum) so the full subset is never held at once.
+            return np.concatenate([spectrum_chunk_fn(int(j), int(j) + 1) for j in cols], axis=0)
+
+    for start in indices:
+        spec_chunk = _chunk(start)
+        contrib = np.log(spec_chunk + eps).sum(axis=0)
+        log_sum = contrib if log_sum is None else log_sum + contrib
+        del spec_chunk, contrib
+        if pbar is not None:
+            pbar.update(1)
+    if log_sum is None:
+        raise ValueError("stream_geomean_landmark: must average over >= 1 gene.")
+    return np.exp(log_sum / float(count))[None, ...]
+
+
+def _physical_polar_coords(
+    grid_shape: tuple[int, int],
+    spacing: tuple[float, float] | None,
+    freq_edges: np.ndarray,
+    n_theta: int,
+) -> tuple[np.ndarray, int]:
+    """Pixel sample coords for a **physical-frequency** polar grid.
+
+    Builds the ``(2, n_radius·n_theta)`` ``(yy, xx)`` coordinate stack into the
+    fftshifted full ``(ny, nx)`` spectrum, where the radius axis samples the
+    *shared physical* frequencies — the bin centres of ``freq_edges`` (cycles
+    per unit length) — and ``theta`` spans the half-plane ``[0, π)`` (a real
+    signal's power spectrum is centrosymmetric). Because a physical frequency
+    ``f`` is converted to a pixel offset using this sample's own
+    ``spacing=(dy, dx)`` and ``(ny, nx)`` (``offset_y = f·sin θ·ny·dy``),
+    samples with **different lattices map the same physical frequency to the
+    same radius bin** — the 2-D analogue of the radial path's shared bin grid.
+
+    Returns ``(coords, n_radius)`` with ``coords`` of shape
+    ``(2, n_radius·n_theta)`` in ``(radius, theta)`` row-major order.
+    """
+    ny, nx = grid_shape
+    dy, dx = spacing if spacing is not None else (1.0 / ny, 1.0 / nx)
+    edges = np.asarray(freq_edges, dtype=float)
+    radii = 0.5 * (edges[:-1] + edges[1:])  # (n_radius,) cycles/unit
+    thetas = np.linspace(0.0, np.pi, n_theta, endpoint=False)
+    rr, tt = np.meshgrid(radii, thetas, indexing="ij")  # (n_radius, n_theta)
+    cy, cx = ny // 2, nx // 2  # fftshift puts DC at floor(n/2)
+    yy = cy + rr * np.sin(tt) * ny * dy
+    xx = cx + rr * np.cos(tt) * nx * dx
+    return np.stack([yy.ravel(), xx.ravel()], axis=0), len(radii)
+
+
+def stream_polar_features(
+    spectrum_chunk_fn: Any,
+    n_genes: int,
+    grid_shape: tuple[int, int],
+    angle_deg: float,
+    *,
+    chunk_size: int,
+    freq_edges: np.ndarray,
+    spacing: tuple[float, float] | None,
+    n_theta: int,
+    fft_solver: str,
+    pbar: Any = None,
+) -> np.ndarray:
+    """Stream rotate → **physical-frequency polar resample** per gene-chunk.
+
+    The ``feature_mode='2d'`` path keeps *directional* content, so each gene's
+    spectrum is rotation-aligned (not radial-collapsed) and then resampled onto
+    a polar grid whose **radius axis is the shared physical-frequency grid
+    (``freq_edges`` bin centres, of length ``n_radius``) and whose ``theta`` axis
+    carries direction. This is a 2-D generalisation of :func:`radial_bin_spectrum`.
+    Because the radius axis is in cycles/unit and shared across samples (see
+    :func:`_physical_polar_coords`), different lattices are **cross-sample
+    aligned**, exactly as the radial path is.
+
+    For each gene-chunk: 2D power spectrum → rotate by ``angle_deg`` →
+    :func:`_to_full_2d` (mirror the rfft half-plane) → fftshift → resample at the
+    physical-frequency polar grid → flatten, discarding the dense 2D block. The
+    full ``(n_genes, ny, n_kx)`` aligned stack is never held. Returns
+    ``(n_genes, n_radius·n_theta)``.
+    """
+    coords, n_radius = _physical_polar_coords(grid_shape, spacing, freq_edges, n_theta)
+    feat_len = n_radius * n_theta
+    parts: list[np.ndarray] = []
+    for start in range(0, n_genes, chunk_size):
+        stop = min(start + chunk_size, n_genes)
+        spec_chunk = spectrum_chunk_fn(start, stop)
+        if angle_deg != 0.0:
+            spec_chunk = apply_rotations_to_spectra(
+                [spec_chunk], [grid_shape], np.asarray([angle_deg]), fft_solver=fft_solver
+            )[0]
+        full = _to_full_2d(spec_chunk, grid_shape, fft_solver)  # (m, ny, nx)
+        shifted = np.fft.fftshift(full, axes=(-2, -1))
+        m = shifted.shape[0]
+        block = np.empty((m, feat_len), dtype=np.float64)
+        for j in range(m):
+            block[j] = scipy.ndimage.map_coordinates(shifted[j], coords, order=1, mode="reflect")
+        parts.append(block)
+        del spec_chunk, full, shifted
+        if pbar is not None:
+            pbar.update(1)
+    return np.concatenate(parts, axis=0)
+
+
 # ---------------------------------------------------------------------------
 # Step 2 — optional 2D rotation alignment
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ import pandas as pd
 import shapely.geometry as sg
 import spatialdata as sd
 from geopandas import GeoDataFrame
+from spatialdata.models import ShapesModel, TableModel
 
 from quadsv.comparators import ComparatorGrid, ComparatorIrregular
 from quadsv.comparators.multisample import compare_two_groups
@@ -125,11 +126,12 @@ def _make_bin_sdata(
             polys.append(sg.box(c, r, c + 1, r + 1))
             row_idx.append(r)
             col_idx.append(c)
-    shapes = GeoDataFrame(
-        {"geometry": polys},
-        index=[f"bin_{i}" for i in range(n_bins)],
+    shapes = ShapesModel.parse(
+        GeoDataFrame(
+            {"geometry": polys},
+            index=[f"bin_{i}" for i in range(n_bins)],
+        )
     )
-    shapes.attrs["spatialdata_attrs"] = {"region": "bins"}
 
     # Per-bin expression table.
     X = np.zeros((n_bins, n_genes), dtype=np.float64)
@@ -146,11 +148,12 @@ def _make_bin_sdata(
     )
     table = ad.AnnData(X=X, obs=obs)
     table.var_names = gene_names
-    table.uns["spatialdata_attrs"] = {
-        "region": "bins",
-        "region_key": "region",
-        "instance_key": "instance_id",
-    }
+    table = TableModel.parse(
+        table,
+        region="bins",
+        region_key="region",
+        instance_key="instance_id",
+    )
 
     sdata = sd.SpatialData(shapes={"bins": shapes}, tables={"table": table})
     return sdata
@@ -216,7 +219,7 @@ class TestComparatorGrid:
         assert cmp.dc_.shape == (len(samples), 3)
         assert cmp.presence_.shape == (len(samples), 3)
         # Pattern test runs without error and returns a frame with a row per gene.
-        df = cmp.test_diff_freq(groups, n_perm=50, random_state=0)
+        df = cmp.test_diff_freq(groups, statistic="welch_t_cauchy")
         assert df.shape[0] == 3
         assert df["P_value"].between(0, 1).all()
 
@@ -273,18 +276,72 @@ class TestComparatorGridFeatures:
             gene_names=gene_names,
             feature_mode="2d",
             n_radial_bins=4,
+            n_theta_bins=8,
             spacing=spacings,
             fft_chunk_size="auto",
         ).compute_spectra(n_jobs=1, landmark_genes=["g0"], progress=False)
 
         assert cmp._grid_shapes == [(9, 11), (11, 9)]
         assert cmp._spacings == spacings
+        assert cmp._n_theta_bins == 8
         assert 8 <= cmp._fft_chunk_size <= cmp._auto_chunk_cap
         assert cmp.rotation_angles_.shape == (2,)
         assert cmp.rotation_angles_[0] == pytest.approx(0.0)
         assert cmp._raw_2d_spectra is None
-        assert cmp.spectra_.shape == (2, 3, 4 * cmp._n_theta)
+        assert cmp.spectra_.shape == (2, 3, 4 * 8)
         assert np.isfinite(cmp.spectra_).all()
+
+    def test_radial_and_2d_use_sample_parallel_dispatch(self, monkeypatch):
+        import quadsv.comparators.base as base_mod
+
+        calls = []
+
+        class FakeParallel:
+            def __init__(self, *, n_jobs, prefer):
+                self.n_jobs = n_jobs
+                self.prefer = prefer
+                calls.append(self)
+
+            def __call__(self, tasks):
+                return [func(*args, **kwargs) for func, args, kwargs in tasks]
+
+        monkeypatch.setattr(base_mod, "Parallel", FakeParallel)
+
+        rng = np.random.default_rng(12)
+        gene_names = ["g0", "g1"]
+        rasters = [rng.standard_normal((2, 8, 8)) for _ in range(3)]
+        samples = _install_grid_rasters(monkeypatch, rasters, gene_names)
+
+        ComparatorGrid(
+            samples,
+            bins="bins",
+            table_name="table",
+            col_key="col_idx",
+            row_key="row_idx",
+            gene_names=gene_names,
+            feature_mode="radial",
+            n_radial_bins=3,
+            fft_chunk_size=1,
+        ).compute_spectra(n_jobs=2, progress=False)
+        assert [c.n_jobs for c in calls] == [2]
+        assert calls[0].prefer == "threads"
+
+        calls.clear()
+        cmp = ComparatorGrid(
+            samples,
+            bins="bins",
+            table_name="table",
+            col_key="col_idx",
+            row_key="row_idx",
+            gene_names=gene_names,
+            feature_mode="2d",
+            n_radial_bins=3,
+            n_theta_bins=4,
+            fft_chunk_size=1,
+        ).compute_spectra(n_jobs=2, landmark_genes=["g0"], progress=False)
+        assert [c.n_jobs for c in calls] == [2, 2]
+        assert all(c.prefer == "threads" for c in calls)
+        assert cmp.spectra_.shape == (3, 2, 3 * 4)
 
 
 class TestComparatorIrregularImport:
@@ -337,6 +394,7 @@ class TestComparatorIrregularFeatures:
             gene_names=gene_names,
             feature_mode="2d",
             n_radial_bins=4,
+            n_theta_bins=6,
             grid_shape=grid_shapes,
             spacing=spacings,
             nufft_chunk_size="auto",
@@ -344,11 +402,12 @@ class TestComparatorIrregularFeatures:
 
         assert cmp._grid_shapes == grid_shapes
         assert cmp._spacings == spacings
+        assert cmp._n_theta_bins == 6
         assert 8 <= cmp._nufft_chunk_size <= cmp._auto_chunk_cap
         assert cmp._raw_2d_spectra is None
         assert cmp.rotation_angles_.shape == (3,)
         assert cmp.rotation_angles_[0] == pytest.approx(0.0)
-        assert cmp.spectra_.shape == (3, 3, 4 * cmp._n_theta)
+        assert cmp.spectra_.shape == (3, 3, 4 * 6)
         assert np.isfinite(cmp.spectra_).all()
 
         covariates = [rng.standard_normal((1, 10, 10)) for _ in range(3)]
@@ -357,6 +416,53 @@ class TestComparatorIrregularFeatures:
         assert ret is cmp
         assert cmp.spectra_.shape == before_shape
         assert np.isfinite(cmp.spectra_).all()
+
+    def test_2d_uses_sample_parallel_dispatch(self, monkeypatch):
+        import quadsv.comparators.base as base_mod
+
+        calls = []
+
+        class FakeParallel:
+            def __init__(self, *, n_jobs, prefer):
+                self.n_jobs = n_jobs
+                self.prefer = prefer
+                calls.append(self)
+
+            def __call__(self, tasks):
+                return [func(*args, **kwargs) for func, args, kwargs in tasks]
+
+        monkeypatch.setattr(base_mod, "Parallel", FakeParallel)
+
+        rng = np.random.default_rng(9)
+        gene_names = ["g0", "g1"]
+        samples = [rng.standard_normal((2, 8, 8)) for _ in range(3)]
+        cmp = ComparatorIrregular(
+            _grid_samples_to_adata(samples, gene_names),
+            gene_names=gene_names,
+            feature_mode="2d",
+            n_radial_bins=3,
+            n_theta_bins=4,
+            grid_shape=(8, 8),
+            spacing=(1.0, 1.0),
+            nufft_chunk_size=1,
+        ).compute_spectra(n_jobs=2, landmark_genes=["g0"], progress=False)
+
+        assert [c.n_jobs for c in calls] == [2, 2]
+        assert all(c.prefer == "threads" for c in calls)
+        assert cmp.spectra_.shape == (3, 2, 3 * 4)
+
+    def test_rejects_non_positive_theta_bins(self):
+        rng = np.random.default_rng(2)
+        gene_names = ["g0", "g1"]
+        samples = [rng.standard_normal((2, 6, 6)) for _ in range(2)]
+        adatas = _grid_samples_to_adata(samples, gene_names)
+        with pytest.raises(ValueError, match="n_theta_bins"):
+            ComparatorIrregular(
+                adatas,
+                gene_names=gene_names,
+                feature_mode="2d",
+                n_theta_bins=0,
+            )
 
     def test_rejects_mismatched_grid_shape_count(self):
         rng = np.random.default_rng(2)
@@ -745,9 +851,9 @@ class TestComparatorCrossConsistency:
         stripes_hi = np.broadcast_to(np.sin(2 * np.pi * y_col / (ny / 2)), (ny, nx))
         for gi in range(2 * n_per_group):
             group = 0 if gi < n_per_group else 1
-            g0 = stripes_y if group == 0 else stripes_x
+            g0 = stripes_y if group == 0 else stripes_hi
             g1 = rng.standard_normal((ny, nx))
-            g2 = stripes_hi
+            g2 = stripes_x
             grids.append(np.stack([g0, g1, g2], axis=0))
             groups.append(group)
         return grids, np.array(groups)

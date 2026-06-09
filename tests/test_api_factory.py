@@ -11,6 +11,7 @@ raise ``TypeError`` with helpful messages.
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import anndata as ad
 import numpy as np
@@ -18,7 +19,6 @@ import pytest
 
 from quadsv import (
     Comparator,
-    ComparatorGrid,
     ComparatorIrregular,
     Detector,
     DetectorGrid,
@@ -73,18 +73,17 @@ class TestComparatorFactory(unittest.TestCase):
         from spatialdata import SpatialData
 
         sdatas = [SpatialData() for _ in range(3)]
-        # ComparatorGrid expects more setup but the factory only checks
-        # the type and forwards. Use pytest.raises to allow downstream
-        # validation errors but still assert the *class* picked first.
-        try:
+        # ComparatorGrid needs a full table-backed SpatialData object, but
+        # factory dispatch only needs to prove the selected class and forwarded
+        # sample list. Patch the constructor to keep this test focused.
+        with patch("quadsv.api.ComparatorGrid") as grid_cls:
+            sentinel = object()
+            grid_cls.return_value = sentinel
+
             cmp = Comparator(sdatas)
-        except (TypeError, ValueError, AttributeError):
-            # Construction may legitimately fail because the
-            # SpatialData objects are empty; we only care that the
-            # factory tried ComparatorGrid, not ComparatorIrregular.
-            pytest.skip("ComparatorGrid construction needs full SpatialData")
-        else:
-            self.assertIsInstance(cmp, ComparatorGrid)
+
+        self.assertIs(cmp, sentinel)
+        grid_cls.assert_called_once_with(sdatas)
 
     def test_empty_list_raises_typeerror(self):
         with pytest.raises(TypeError, match="non-empty"):

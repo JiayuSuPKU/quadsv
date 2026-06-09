@@ -41,6 +41,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
+from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
 # Suppress known deprecation warnings from SpatialData dependencies BEFORE importing them.
@@ -48,13 +49,13 @@ warnings.filterwarnings("ignore", category=FutureWarning, message=".*legacy Dask
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources is deprecated.*")
 
 from quadsv.comparators.multisample import (
-    align_spectra_by_rotation,
     compare_glm,
     compare_two_groups,
     compare_two_groups_masked,
     compare_two_groups_scalar,
     compute_sample_spectrum,
     radial_bin_spectrum,
+    stream_polar_features,
 )
 from quadsv.comparators.multisample import (
     # Aliased to leading-underscore names to avoid shadowing the
@@ -74,6 +75,60 @@ from quadsv.statistics import (
 __all__: list[str] = []
 
 logger = logging.getLogger(__name__)
+
+# Helper functions for running per-sample computations.
+
+
+def _run_per_sample(
+    worker: Any,
+    n_samples_total: int,
+    *,
+    n_chunks_per_sample: int,
+    desc: str,
+    n_jobs: int,
+    progress: bool,
+) -> list[Any]:
+    """Invoke ``worker(i, pbar)`` for each sample, preserving sample order."""
+    out: list[Any] = [None] * n_samples_total
+
+    run_sequential = progress or n_jobs == 1
+    if run_sequential:
+        n_total = n_samples_total * n_chunks_per_sample
+        pbar: tqdm | None = tqdm(total=n_total, desc=desc) if progress else None
+        for i in range(n_samples_total):
+            if pbar is not None:
+                pbar.set_postfix_str(f"sample {i + 1}/{n_samples_total}")
+            out[i] = worker(i, pbar)
+        if pbar is not None:
+            pbar.close()
+    else:
+        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(worker)(i, None) for i in range(n_samples_total)
+        )
+        for i, r in enumerate(results):
+            out[i] = r
+
+    return out
+
+
+def _unpack_sample_triples(
+    results: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
+    """Convert ``[(features, dc, presence), ...]`` to comparator return values."""
+    feats, dc_list, pres_list = zip(*results, strict=True)
+    dc = np.stack([np.asarray(x) for x in dc_list], axis=0)
+    presence = np.stack([np.asarray(x) for x in pres_list], axis=0)
+    return [np.asarray(x) for x in feats], dc, presence
+
+
+def _unpack_sample_quads(
+    results: list[tuple[np.ndarray, np.ndarray, np.ndarray, Any]],
+) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, list[Any]]:
+    """Convert ``[(features, dc, presence, extra), ...]`` to stacked outputs."""
+    feats, dc_list, pres_list, extra = zip(*results, strict=True)
+    dc = np.stack([np.asarray(x) for x in dc_list], axis=0)
+    presence = np.stack([np.asarray(x) for x in pres_list], axis=0)
+    return [np.asarray(x) for x in feats], dc, presence, list(extra)
 
 
 class _ComparatorBase:
@@ -139,6 +194,7 @@ class _ComparatorBase:
 
     # --- private attribute stubs populated by subclass __init__ -------
     _n_radial_bins: int
+    _n_theta_bins: int
     _fft_solver: str
     _workers: int | None
     _presence_threshold: float
@@ -154,20 +210,197 @@ class _ComparatorBase:
 
     _raw_2d_spectra: list[np.ndarray] | None = None
 
+    # Angular resolution of the ``feature_mode='2d'`` polar feature grid: the
+    # 2-D feature is ``(n_radial_bins radius × _n_theta_bins angle)`` over the half
+    # plane ``[0, π)``. Subclasses may override.
+    _n_theta_bins: int = 36
+
     # ------------------------------------------------------------------
     @abstractmethod
     def _compute_spectra(
-        self, n_jobs: int, progress: bool
+        self,
+        n_jobs: int,
+        progress: bool,
+        landmark_genes: Sequence[str] | None = None,
     ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        """Compute per-sample 2D spectra + DC + presence mask.
+        """Stream per-sample **feature** spectra + DC + presence mask.
 
-        Implemented by each backend. Returns ``(raw_2d, dc, presence)`` where
-        ``raw_2d`` is a list of ``(n_genes, ny, n_kx)`` spectra (layout
-        determined by :attr:`_spectrum_fft_solver`), ``dc`` is a
-        ``(n_samples, n_genes)`` float array, and ``presence`` is a
-        ``(n_samples, n_genes)`` boolean mask.
+        Implemented by each backend. The dense full ``(n_genes, ny, n_kx)`` 2D
+        spectra should **never** materialised in either mode and peak memory stays
+        at ``O(chunk · ny · nx)``. Returns ``(feats, dc, presence)``:
+
+        - ``feature_mode='radial'`` — rasterise/NUFFT → per-gene-chunk FFT →
+          radial-bin, discarding each dense chunk; ``feats`` are
+          **radial-binned** ``(n_genes, K)`` arrays. No alignment needed here,
+          and the ``landmark_genes`` argument is ignored.
+        - ``feature_mode='2d'`` — a **two-pass** streamed rotation alignment:
+          (A) learn per-sample rotation angles against a reference using
+          landmark genes (default: use the per-sample *geometric-mean* spectrum as
+          a single landmark, like :func:`normalize_background`; optionally, align
+          the spectra of an explicit ``landmark_genes`` set).
+          (B) for every gene-chunk, first rotate by the estimated angle, then
+          resample onto a polar ``(radius, theta)`` grid whose **radius axis is
+          the shared physical-frequency grid** (:attr:`freq_edges`, the same
+          edges the radial path uses) and whose ``theta`` axis (length
+          :attr:`_n_theta_bins`) carries direction, and flatten — discarding each
+          dense chunk. ``feats`` are ``(n_genes, n_radial_bins · _n_theta_bins)`` and
+          are cross-sample aligned (heterogeneous lattices map the same physical
+          frequency to the same radius bin, like radial mode). The recovered
+          angles are stored on ``self.rotation_angles_``.
+
+        ``dc`` is ``(n_samples, n_genes)`` and ``presence`` is
+        ``(n_samples, n_genes)`` bool. Each backend calls
+        :meth:`_resolve_freq_edges` once its per-sample spacing metadata is known
+        and before any streamed reducer consumes :attr:`freq_edges`. When an
+        explicit ``landmark_genes`` set would require caching the full landmark
+        spectra beyond :attr:`_landmark_cache_warn_bytes`, the backend warns and
+        falls back to a single streamed geometric mean **of the landmark genes**
+        (see :meth:`_landmark_cache_fits`) instead of raising.
         """
         raise NotImplementedError
+
+    # Backend cache sweet-spot cap for ``chunk_size='auto'`` — the empirically
+    # tuned caps from :func:`quadsv.statistics.auto_chunk_size` (FFT → 32,
+    # NUFFT → 64). Subclasses override. The live-memory budget (across all
+    # workers) is :attr:`_auto_chunk_budget_bytes`.
+    _auto_chunk_cap: int = 32
+    _auto_chunk_budget_bytes: int = 2 * 1024**3  # 2 GiB (statistics default)
+
+    @staticmethod
+    def _normalize_chunk_spec(spec: int | str) -> int | str:
+        """Validate a chunk-size spec at construction; return ``'auto'`` or a ``>=1`` int."""
+        if isinstance(spec, str):
+            if spec != "auto":
+                raise ValueError(f"chunk_size must be a positive int or 'auto', got {spec!r}.")
+            return "auto"
+        return max(1, int(spec))
+
+    @staticmethod
+    def _normalize_n_theta_bins(n_theta_bins: int) -> int:
+        """Validate the angular bin count used by ``feature_mode='2d'``."""
+        n_theta = int(n_theta_bins)
+        if n_theta < 1:
+            raise ValueError(f"n_theta_bins must be a positive int, got {n_theta_bins!r}.")
+        return n_theta
+
+    @staticmethod
+    def _broadcast_pairs(
+        value: Any, n_samples: int, *, name: str, cast: Any
+    ) -> list[tuple[Any, Any]] | None:
+        """Normalise a single ``(a, b)`` pair *or* a per-sample sequence of pairs.
+
+        Returns a length-``n_samples`` list of ``(cast(a), cast(b))`` tuples, or
+        ``None`` when ``value`` is ``None``. A single ``(a, b)`` (1-D, length 2)
+        is broadcast to every sample; an ``(n_samples, 2)`` sequence is taken
+        per-sample. This lets ``spacing`` / ``grid_shape`` be set globally or
+        adjusted per sample so the resulting grids — and thus frequencies — are
+        in the same physical units across heterogeneous samples.
+        """
+        if value is None:
+            return None
+        arr = np.asarray(value)
+        if arr.ndim == 1 and arr.shape[0] == 2:
+            return [(cast(arr[0]), cast(arr[1]))] * n_samples
+        if arr.ndim == 2 and arr.shape[1] == 2:
+            if arr.shape[0] != n_samples:
+                raise ValueError(
+                    f"per-sample {name} has {arr.shape[0]} rows but n_samples={n_samples}."
+                )
+            return [(cast(r[0]), cast(r[1])) for r in arr]
+        raise ValueError(
+            f"{name} must be a 2-tuple (dy, dx) or an (n_samples, 2) sequence of them; "
+            f"got shape {tuple(arr.shape)}."
+        )
+
+    # ------------------------------------------------------------------
+    def _resolve_chunk_size(
+        self, spec: int | str, grid_shapes: list[tuple[int, int]], *, n_jobs: int = 1
+    ) -> int:
+        """Resolve a chunk-size spec (an int, or ``'auto'``) to an int.
+
+        ``'auto'`` reuses :func:`quadsv.statistics.resolve_chunk_size` — the
+        same cache sweet-spot cap (:attr:`_auto_chunk_cap`) and live-memory
+        budget (:attr:`_auto_chunk_budget_bytes`) as the Q/R-test chunker — with
+        ``per_feat = max(ny·nx) · 8`` bytes (one dense lattice block per gene).
+        An int is returned as-is (floored at 1).
+        """
+        if not isinstance(spec, str):
+            return max(1, int(spec))
+        if spec != "auto":
+            raise ValueError(f"chunk_size must be a positive int or 'auto', got {spec!r}.")
+        from quadsv.statistics import resolve_chunk_size
+
+        max_lat = max((ny * nx for (ny, nx) in grid_shapes), default=1)
+        return resolve_chunk_size(
+            self._auto_chunk_cap,
+            max(max_lat, 1) * 8,
+            n_jobs=n_jobs,
+            budget_bytes=self._auto_chunk_budget_bytes,
+        )
+
+    # Rotation-landmark cache budget (bytes). An explicit ``landmark_genes``
+    # set in 2d mode needs its full ``(n_landmarks, ny, n_kx)`` spectra cached
+    # per sample to estimate angles; if the largest such cache would exceed this
+    # we raise rather than risk an OOM. The streamed *geomean* landmark (the
+    # default) is a single ``(1, ny, n_kx)`` spectrum and never trips this.
+    _landmark_cache_warn_bytes: int = 8 * 1024**3  # 8 GiB
+
+    # ------------------------------------------------------------------
+    def _landmark_cache_fits(self, n_landmarks: int) -> bool:
+        """Whether caching ``n_landmarks`` full-2D spectra per sample fits budget.
+
+        The explicit-``landmark_genes`` path (2d mode) holds each sample's
+        ``(n_landmarks, ny, n_kx)`` landmark spectra in memory to estimate the
+        rotation. When the worst-case cache would exceed
+        :attr:`_landmark_cache_warn_bytes` this returns ``False`` so the caller
+        can fall back to a single streamed geometric-mean landmark (built over
+        just the landmark genes) instead of risking an OOM. Returns ``True``
+        (cache the per-gene landmark spectra) otherwise.
+        """
+        if not self._grid_shapes:
+            return True
+        worst = 0
+        for ny, nx in self._grid_shapes:
+            n_kx = nx if self._spectrum_fft_solver == "fft2" else nx // 2 + 1
+            worst = max(worst, n_landmarks * ny * n_kx * 8)
+        if worst > self._landmark_cache_warn_bytes:
+            warnings.warn(
+                f"Rotation alignment with {n_landmarks} explicit landmark genes would cache "
+                f"up to {worst / 1024**3:.1f} GiB of 2D spectra per sample "
+                f"(limit {self._landmark_cache_warn_bytes / 1024**3:.1f} GiB). Falling back "
+                "to a single streamed geometric-mean of the landmark genes to avoid OOM. "
+                "Pass fewer landmark_genes or raise _landmark_cache_warn_bytes to keep the "
+                "per-gene landmark alignment.",
+                stacklevel=2,
+            )
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    def _resolve_freq_edges(self) -> None:
+        """Populate :attr:`freq_edges` (shared physical-frequency grid), if unset.
+
+        Uses the per-sample physical ``self._spacings`` (already known before
+        the spectra pass for both backends) to build a common bin grid on
+        ``[0, min Nyquist]``. Used by **both** feature modes: the radial path
+        bins onto these edges, and the 2-D path resamples its polar radius axis
+        onto the same edges so heterogeneous lattices stay cross-sample aligned.
+        Idempotent and a no-op when ``freq_edges`` is already set or cannot yet
+        be derived.
+        """
+        if self.freq_edges is not None or not self._spacings:
+            return
+
+        # Find the minimum Nyquist frequency across all samples
+        nyquists = [1.0 / (2.0 * max(dy, dx)) for (dy, dx) in self._spacings]
+        f_max = float(min(nyquists))
+        # Create the shared frequency edges
+        self.freq_edges = np.linspace(0.0, f_max * (1.0 + 1e-9), self._n_radial_bins + 1)
+        logger.info(
+            "Auto-generated %d radial bins on [0, %.4g] cycles per unit length.",
+            self._n_radial_bins,
+            f_max,
+        )
 
     # ------------------------------------------------------------------
     def compute_spectra(
@@ -190,8 +423,8 @@ class _ComparatorBase:
             Only used in ``feature_mode='2d'``. Names of genes (matched against
             :attr:`gene_names`) whose spectra define the rotation-alignment
             landmarks. Recovered rotations are still applied to every gene in
-            :attr:`gene_names`. If None (default), every gene is used as a
-            landmark.
+            :attr:`gene_names`. If None (default), a single streamed geometric
+            mean over every gene is used as the landmark.
         progress : bool, default True
             Show tqdm progress bars over the three phases (spectrum compute,
             optional rotation alignment, radial binning).
@@ -202,68 +435,20 @@ class _ComparatorBase:
         """
         logger.info(
             "Computing per-sample spectra (n_samples=%d, mean-centered)...",
-            len(self._grid_shapes),
+            len(self.samples),
         )
-        self._raw_2d_spectra, self.dc_, self.presence_ = self._compute_spectra(
-            n_jobs=n_jobs, progress=progress
+        # ``_compute_spectra`` streams and returns the **final per-sample
+        # features** for both modes — radial-binned ``(n_genes, K)`` (radial), or
+        # rotation-aligned physical-frequency polar features
+        # ``(n_genes, n_radial_bins · _n_theta_bins)`` (2d). The dense full 2D spectra
+        # are never held; rotation angles (2d) are recorded on
+        # ``self.rotation_angles_`` by the backend.
+        self._raw_2d_spectra = None
+        per_sample, self.dc_, self.presence_ = self._compute_spectra(
+            n_jobs=n_jobs, progress=progress, landmark_genes=landmark_genes
         )
 
-        if self.feature_mode == "2d":
-            # Pick landmarks (defaults to every gene).
-            if landmark_genes is not None:
-                name_to_idx = {g: i for i, g in enumerate(self.gene_names)}
-                missing = [g for g in landmark_genes if g not in name_to_idx]
-                if missing:
-                    raise KeyError(f"landmark_genes not in gene_names: {missing}")
-                lm_idx = np.asarray([name_to_idx[g] for g in landmark_genes], dtype=int)
-                landmark_spectra = [s[lm_idx] for s in self._raw_2d_spectra]
-            else:
-                landmark_spectra = self._raw_2d_spectra
-            aligned, angles = align_spectra_by_rotation(
-                landmark_spectra,
-                grid_shapes=self._grid_shapes,
-                target_spectra=self._raw_2d_spectra,
-                fft_solver=self._spectrum_fft_solver,
-                progress=progress,
-            )
-            self._raw_2d_spectra = aligned
-            self.rotation_angles_ = angles
-
-        # Build a common bin-edge grid for physical-frequency mode.
-        if self.feature_mode == "radial" and self._spacings is not None and self.freq_edges is None:
-            nyquists = [1.0 / (2.0 * max(dy, dx)) for (dy, dx) in self._spacings]
-            f_max = float(min(nyquists))
-            self.freq_edges = np.linspace(0.0, f_max * (1.0 + 1e-9), self._n_radial_bins + 1)
-            logger.info(
-                "Auto-generated %d radial bins on [0, %.4g] cycles per unit length.",
-                self._n_radial_bins,
-                f_max,
-            )
-
-        # Reduce to per-sample feature matrices of shape (n_genes, K) and stack.
-        feats: list[np.ndarray] = []
-        iter_samples: Any = enumerate(zip(self._raw_2d_spectra, self._grid_shapes, strict=False))
-        if progress:
-            iter_samples = tqdm(
-                iter_samples, total=len(self._raw_2d_spectra), desc="Radial binning"
-            )
-        for i, (spec_i, shape) in iter_samples:
-            if self.feature_mode == "radial":
-                spacing_i = self._spacings[i] if self._spacings is not None else None
-                f = radial_bin_spectrum(
-                    spec_i,
-                    grid_shape=shape,
-                    n_bins=self._n_radial_bins,
-                    fft_solver=self._spectrum_fft_solver,
-                    spacing=spacing_i,
-                    edges=self.freq_edges,
-                )
-            else:
-                ny, nx = shape
-                k = min(self._n_radial_bins, ny // 2, nx // 2)
-                low = spec_i[:, :k, :k] if spec_i.shape[-1] > k else spec_i[:, :k, :]
-                f = low.reshape(low.shape[0], -1)
-            feats.append(f)
+        feats = list(per_sample)
         K = min(f.shape[-1] for f in feats)
         feats = [f[..., :K] for f in feats]
         self.spectra_ = np.stack(feats, axis=0)
@@ -392,10 +577,25 @@ class _ComparatorBase:
                 spacing=spacing,
                 edges=self.freq_edges,
             )
-        ny, nx = cov_shape
-        k = min(self._n_radial_bins, ny // 2, nx // 2)
-        low = cov_2d[:, :k, :k] if cov_2d.shape[-1] > k else cov_2d[:, :k, :]
-        return low.reshape(low.shape[0], -1)
+        if self.freq_edges is None:
+            raise RuntimeError("2D covariate features require .compute_spectra() first.")
+        angles = self.rotation_angles_
+        angle = 0.0 if angles is None else float(angles[sample_index])
+
+        def _cov_chunk(start: int, stop: int) -> np.ndarray:
+            return cov_2d[start:stop]
+
+        return stream_polar_features(
+            _cov_chunk,
+            cov_2d.shape[0],
+            cov_shape,
+            angle,
+            chunk_size=max(1, cov_2d.shape[0]),
+            freq_edges=self.freq_edges,
+            spacing=spacing,
+            n_theta=self._n_theta_bins,
+            fft_solver=self._spectrum_fft_solver,
+        )
 
     def _covariate_features_from_keys(self, keys: Sequence[str]) -> list[np.ndarray]:
         """Column-key list → per-sample ``(n_covariates, K)`` covariate features.

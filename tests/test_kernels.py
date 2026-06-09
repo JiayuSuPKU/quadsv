@@ -5,6 +5,7 @@ Unit tests for kernel classes and methods.
 import unittest
 
 import numpy as np
+import pytest
 import scipy.sparse as sp
 
 from quadsv.kernels import MatrixKernel
@@ -446,9 +447,10 @@ class TestKernelUtilities(unittest.TestCase):
 
         # Singular precision triggers pseudo-inverse path
         M = np.array([[1.0, 0.0], [0.0, 0.0]])
-        kernel_inv = MatrixKernel.from_matrix(
-            M, is_precision=True, method="car", standardize=True, centering=False
-        )
+        with pytest.warns(RuntimeWarning, match="Precision matrix is singular"):
+            kernel_inv = MatrixKernel.from_matrix(
+                M, is_precision=True, method="car", standardize=True, centering=False
+            )
         K_inv = kernel_inv.realization()
         self.assertEqual(K_inv.shape, (2, 2))
         self.assertTrue(np.allclose(K_inv, K_inv.T, rtol=1e-12))
