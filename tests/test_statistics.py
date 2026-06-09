@@ -10,10 +10,80 @@ from scipy.sparse import csc_matrix, csr_matrix
 from quadsv.kernels import MatrixKernel
 from quadsv.statistics import (
     compute_null_params,
+    effective_rank,
+    gene_pattern_diversity,
     liu_sf,
     spatial_q_test,
     spatial_r_test,
+    within_group_pattern_diversity,
 )
+
+
+class TestEffectiveRank(unittest.TestCase):
+    """Effective-rank and pattern-diversity statistics."""
+
+    def test_effective_rank_identity_equals_K(self):
+        for K in [3, 10, 30]:
+            self.assertAlmostEqual(effective_rank(np.eye(K)), K, places=12)
+
+    def test_effective_rank_rank_one_equals_one(self):
+        rng = np.random.default_rng(0)
+        v = rng.standard_normal(15)
+        cov = np.outer(v, v)
+        self.assertAlmostEqual(effective_rank(cov), 1.0, places=10)
+
+    def test_effective_rank_bounds(self):
+        rng = np.random.default_rng(1)
+        for _ in range(20):
+            K = rng.integers(2, 30)
+            X = rng.standard_normal((50, K))
+            cov = X.T @ X / 50
+            ke = effective_rank(cov)
+            self.assertGreaterEqual(ke, 1.0 - 1e-10)
+            self.assertLessEqual(ke, K + 1e-10)
+
+    def test_effective_rank_with_weights_changes_value(self):
+        K = 20
+        cov = np.eye(K)
+        ke_uniform = effective_rank(cov, weights=np.ones(K) / K)
+        self.assertAlmostEqual(ke_uniform, K, places=10)
+        w_concentrated = np.zeros(K)
+        w_concentrated[0] = 1.0
+        ke_concentrated = effective_rank(cov, weights=w_concentrated)
+        self.assertAlmostEqual(ke_concentrated, 1.0, places=10)
+
+    def test_effective_rank_invalid_inputs(self):
+        with self.assertRaisesRegex(ValueError, "square 2D matrix"):
+            effective_rank(np.zeros((5, 4)))
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            effective_rank(np.eye(5), weights=np.array([1, 1, 1, 1, -1]))
+
+    def test_gene_pattern_diversity_low_vs_high_heterogeneity(self):
+        """Rank-1 spectra should have lower diversity than iid spectra."""
+        rng = np.random.default_rng(0)
+        K = 10
+        shape = np.linspace(1, 5, K)
+        gene_scales = rng.uniform(0.5, 2.0, size=200)
+        spectra_rank1 = np.exp(np.log(shape)[None, :] + np.log(gene_scales)[:, None])
+        ke_rank1 = gene_pattern_diversity(spectra_rank1)
+        self.assertLess(ke_rank1, 1.5)
+        spectra_iid = np.exp(rng.standard_normal((200, K)))
+        ke_iid = gene_pattern_diversity(spectra_iid)
+        self.assertGreater(ke_iid, K * 0.5)
+
+    def test_within_group_pattern_diversity_real_data_like(self):
+        """Within-group diversity should distinguish rank-1 from iid spectra."""
+        rng = np.random.default_rng(3)
+        n_a, n_b, G, K = 4, 4, 800, 20
+        scalar = rng.standard_normal((n_a + n_b, G, 1))
+        spectra = np.exp(scalar)
+        groups = np.array([0] * n_a + [1] * n_b)
+        ke = within_group_pattern_diversity(spectra, groups)
+        self.assertLess(ke, 2.0)
+
+        spectra_iid = np.exp(rng.standard_normal((n_a + n_b, G, K)))
+        ke_iid = within_group_pattern_diversity(spectra_iid, groups)
+        self.assertGreater(ke_iid, K * 0.5)
 
 
 class TestStatisticalFunctions(unittest.TestCase):
