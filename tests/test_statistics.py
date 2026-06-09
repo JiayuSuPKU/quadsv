@@ -9,10 +9,12 @@ from scipy.sparse import csc_matrix, csr_matrix
 
 from quadsv.kernels import MatrixKernel
 from quadsv.statistics import (
+    auto_chunk_size,
     compute_null_params,
     effective_rank,
     gene_pattern_diversity,
     liu_sf,
+    resolve_chunk_size,
     spatial_q_test,
     spatial_r_test,
     within_group_pattern_diversity,
@@ -328,6 +330,15 @@ class TestKernelPrimitivesAndNullParams(unittest.TestCase):
             params = compute_null_params(self.kernel, method=method)
             self.assertIn("var_R", params)
             self.assertGreater(params["var_R"], 0.0)
+
+    def test_auto_chunk_size_respects_matrix_cap_and_worker_budget(self):
+        per_feat = (24 if getattr(self.kernel, "stores_precision", False) else 16) * self.n
+        self.assertEqual(auto_chunk_size(self.kernel, budget_bytes=per_feat * 100), 16)
+        self.assertEqual(auto_chunk_size(self.kernel, n_jobs=2, budget_bytes=per_feat * 16), 8)
+
+    def test_resolve_chunk_size_respects_cap_and_worker_budget(self):
+        self.assertEqual(resolve_chunk_size(32, 100, budget_bytes=10_000), 32)
+        self.assertEqual(resolve_chunk_size(32, 100, n_jobs=4, budget_bytes=6_400), 16)
 
     def test_spatial_r_test_consumes_var_R(self):
         """Supplying var_R via null_params should match the on-the-fly path exactly."""

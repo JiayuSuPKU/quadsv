@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import scipy.sparse as sp
 from scipy.stats import chi2, ncx2, norm
@@ -9,6 +11,7 @@ from quadsv.kernels import Kernel
 
 __all__ = [
     "auto_chunk_size",
+    "resolve_chunk_size",
     "compute_null_params",
     "effective_rank",
     "gene_pattern_diversity",
@@ -297,10 +300,52 @@ def auto_chunk_size(
         # LU factor itself fills L3 (~200k for k≈4 nbrs, rho≈0.9).
         chunk_cap = 16 if n < 200_000 else 8
 
-    n_workers = max(1, int(n_jobs))
-    per_worker_budget = max(per_feat, budget_bytes // n_workers)
+    return resolve_chunk_size(chunk_cap, per_feat, n_jobs=n_jobs, budget_bytes=budget_bytes)
+
+
+def resolve_chunk_size(
+    chunk_cap: int,
+    per_feat_bytes: int,
+    *,
+    n_jobs: int = 1,
+    budget_bytes: int = _DEFAULT_CHUNK_BUDGET,
+) -> int:
+    """Resolve a per-feature chunk size: ``min(cache-cap, memory-cap)``.
+
+    The kernel-free core of :func:`auto_chunk_size`, shared by the
+    :class:`~quadsv.ComparatorGrid` / :class:`~quadsv.ComparatorIrregular`
+    streaming spectrum loops so they reuse the same empirically-tuned cache
+    sweet-spot caps (FFT → 32, NUFFT → 64) and live-memory budget.
+
+    Parameters
+    ----------
+    chunk_cap : int
+        Backend cache sweet-spot cap (32 for FFT, 64 for NUFFT — the caps from
+        :func:`auto_chunk_size`'s empirical sweep).
+    per_feat_bytes : int
+        Transient bytes held per feature (gene) in the chunk loop.
+    n_jobs : int, default 1
+        Planned parallel workers; ``budget_bytes`` is divided by this.
+    budget_bytes : int, default 2 GiB
+        Aggregate live-memory cap across all workers.
+
+    Returns
+    -------
+    int
+        A chunk size in ``[min(8, chunk_cap), chunk_cap]``.
+    """
+    cap = max(1, int(chunk_cap))
+    per_feat = max(1, int(per_feat_bytes))
+    requested_workers = int(n_jobs)
+    if requested_workers < 0:
+        # Match joblib's convention: -1 means all CPUs, -2 all but one, etc.
+        n_workers = max(1, (os.cpu_count() or 1) + 1 + requested_workers)
+    else:
+        n_workers = max(1, requested_workers)
+    per_worker_budget = max(per_feat, int(budget_bytes) // n_workers)
     mem_cap = int(per_worker_budget // per_feat)
-    return int(np.clip(min(mem_cap, chunk_cap), 8, chunk_cap))
+    floor = min(8, cap)
+    return int(np.clip(min(mem_cap, cap), floor, cap))
 
 
 def _liu_prepare_from_cumulants(
