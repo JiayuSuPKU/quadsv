@@ -343,6 +343,46 @@ class TestComparatorGridFeatures:
         assert all(c.prefer == "threads" for c in calls)
         assert cmp.spectra_.shape == (3, 2, 3 * 4)
 
+    def test_subset_returns_fitted_comparator_view(self, monkeypatch):
+        rng = np.random.default_rng(13)
+        gene_names = ["g0", "g1"]
+        rasters = [rng.standard_normal((2, 8, 8)) for _ in range(3)]
+        samples = _install_grid_rasters(monkeypatch, rasters, gene_names)
+        spacings = [(1.0, 1.0), (0.8, 1.0), (1.0, 0.8)]
+        cmp = ComparatorGrid(
+            samples,
+            bins="bins",
+            table_name="table",
+            col_key="col_idx",
+            row_key="row_idx",
+            gene_names=gene_names,
+            feature_mode="2d",
+            n_radial_bins=3,
+            n_theta_bins=4,
+            spacing=spacings,
+            fft_chunk_size=1,
+        ).compute_spectra(n_jobs=1, landmark_genes=["g0"], progress=False)
+        cmp._raw_2d_spectra = [np.asarray([i]) for i in range(len(cmp.samples))]
+
+        sub = cmp.subset([2, 0])
+
+        assert isinstance(sub, ComparatorGrid)
+        assert sub is not cmp
+        assert [id(sample) for sample in sub.samples] == [
+            id(cmp.samples[2]),
+            id(cmp.samples[0]),
+        ]
+        np.testing.assert_array_equal(sub.spectra_, cmp.spectra_[[2, 0]])
+        np.testing.assert_array_equal(sub.dc_, cmp.dc_[[2, 0]])
+        np.testing.assert_array_equal(sub.presence_, cmp.presence_[[2, 0]])
+        np.testing.assert_array_equal(sub.rotation_angles_, cmp.rotation_angles_[[2, 0]])
+        assert sub._grid_shapes == [(8, 8), (8, 8)]
+        assert sub._spacings == [spacings[2], spacings[0]]
+        assert [int(x[0]) for x in sub._raw_2d_spectra] == [2, 0]
+
+        mask_sub = cmp.subset(np.array([False, True, True]))
+        np.testing.assert_array_equal(mask_sub.spectra_, cmp.spectra_[[1, 2]])
+
 
 class TestComparatorIrregularImport:
     """Constructor validation for the AnnData-backed comparator."""

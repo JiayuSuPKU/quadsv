@@ -34,6 +34,7 @@ Concrete classes live in sibling modules:
 
 from __future__ import annotations
 
+import copy
 import logging
 import warnings
 from abc import abstractmethod
@@ -453,6 +454,41 @@ class _ComparatorBase:
         feats = [f[..., :K] for f in feats]
         self.spectra_ = np.stack(feats, axis=0)
         return self
+
+    # ------------------------------------------------------------------
+    def subset(self, indices: Sequence[int] | np.ndarray) -> _ComparatorBase:
+        """Return a lightweight comparator view over a subset of samples.
+
+        The returned comparator is a shallow copy of ``self``: sample containers
+        and gene-level configuration are shared, while per-sample fitted arrays
+        and per-sample metadata are indexed to ``indices``. This is intended for
+        running multiple contrasts against one fitted comparator without
+        recomputing spectra.
+        """
+        idx = np.asarray(indices)
+        if idx.dtype == bool:
+            if idx.ndim != 1 or idx.size != len(self.samples):
+                raise IndexError(
+                    f"boolean sample mask must have length {len(self.samples)}, got {idx.size}"
+                )
+            idx = np.flatnonzero(idx)
+        else:
+            idx = idx.astype(int, copy=False)
+        idx = np.ravel(idx)
+
+        sub = copy.copy(self)
+        sub.samples = [self.samples[i] for i in idx]
+        sub.spectra_ = None if self.spectra_ is None else self.spectra_[idx]
+        sub.dc_ = None if self.dc_ is None else self.dc_[idx]
+        sub.presence_ = None if self.presence_ is None else self.presence_[idx]
+        sub.rotation_angles_ = None if self.rotation_angles_ is None else self.rotation_angles_[idx]
+        if self._spacings is not None and len(self._spacings) == len(self.samples):
+            sub._spacings = [self._spacings[i] for i in idx]
+        if self._grid_shapes and len(self._grid_shapes) == len(self.samples):
+            sub._grid_shapes = [self._grid_shapes[i] for i in idx]
+        if self._raw_2d_spectra is not None and len(self._raw_2d_spectra) == len(self.samples):
+            sub._raw_2d_spectra = [self._raw_2d_spectra[i] for i in idx]
+        return sub
 
     # ------------------------------------------------------------------
     # Post-fit transforms
