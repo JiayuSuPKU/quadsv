@@ -7,12 +7,44 @@ import unittest
 
 import numpy as np
 
+import quadsv.utils as utils
 from quadsv.utils import (
+    apply_bh_correction,
     compute_torus_distance_matrix,
     convert_visium_to_physical,
     get_rect_coords,
     get_visium_coords,
 )
+
+
+class TestApplyBHCorrection(unittest.TestCase):
+    """Test public Benjamini-Hochberg adjustment helper."""
+
+    def test_exported_from_utils(self):
+        assert "apply_bh_correction" in utils.__all__
+
+    def test_adjusts_raw_pvalues(self):
+        pvals = np.array([0.01, 0.04, 0.03, 0.002, 0.8])
+        expected = np.array([0.025, 0.05, 0.05, 0.01, 0.8])
+
+        adjusted = apply_bh_correction(pvals)
+
+        np.testing.assert_allclose(adjusted, expected)
+
+    def test_preserves_shape_and_nonfinite_entries(self):
+        pvals = np.array([[0.01, np.nan], [0.04, np.inf]])
+
+        adjusted = apply_bh_correction(pvals)
+
+        assert adjusted.shape == pvals.shape
+        np.testing.assert_allclose(adjusted[0, 0], 0.02)
+        np.testing.assert_allclose(adjusted[1, 0], 0.04)
+        assert np.isnan(adjusted[0, 1])
+        assert np.isnan(adjusted[1, 1])
+
+    def test_rejects_invalid_raw_pvalues(self):
+        with self.assertRaises(ValueError):
+            apply_bh_correction([0.1, -0.1, 0.2])
 
 
 class TestGetRectCoords(unittest.TestCase):

@@ -14,7 +14,7 @@ from quadsv.detectors.base import Detector
 from quadsv.kernels import Kernel, MatrixKernel
 from quadsv.kernels.nufft import NUFFTKernel, _standardize_features
 from quadsv.statistics import compute_null_params, spatial_q_test
-from quadsv.utils import _apply_bh_correction
+from quadsv.utils import apply_bh_correction
 
 __all__ = ["DetectorIrregular"]
 
@@ -983,7 +983,7 @@ class DetectorIrregular(Detector):
 
         # 6. Multiple testing correction (Benjamini-Hochberg)
         if return_pval:
-            _apply_bh_correction(df)
+            df["P_adj"] = apply_bh_correction(df["P_value"])
 
         return df.sort_values(by="Q", ascending=False)
 
@@ -1184,7 +1184,7 @@ class DetectorIrregular(Detector):
 
         # 7. Multiple testing correction (Benjamini-Hochberg)
         if return_pval:
-            _apply_bh_correction(df)
+            df["P_adj"] = apply_bh_correction(df["P_value"])
 
         return df.sort_values(by="Z_score", key=abs, ascending=False)
 
@@ -1334,7 +1334,7 @@ class DetectorIrregular(Detector):
         if not return_pval:
             df = df.drop(columns=["P_value", "Z_score"], errors="ignore")
         elif return_pval:
-            _apply_bh_correction(df)
+            df["P_adj"] = apply_bh_correction(df["P_value"])
         return df.sort_values("Q", ascending=False).reset_index(drop=True)
 
     def _compute_rstat_nufft(
@@ -1412,5 +1412,5 @@ class DetectorIrregular(Detector):
 
         df = pd.DataFrame(results)
         if return_pval:
-            _apply_bh_correction(df)
+            df["P_adj"] = apply_bh_correction(df["P_value"])
         return df.sort_values("R", ascending=False).reset_index(drop=True)

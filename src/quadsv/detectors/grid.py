@@ -20,7 +20,7 @@ from tqdm import tqdm
 from quadsv.detectors.base import Detector
 from quadsv.kernels.fft import FFTKernel
 from quadsv.statistics import spatial_q_test
-from quadsv.utils import _apply_bh_correction
+from quadsv.utils import apply_bh_correction
 
 __all__ = ["DetectorGrid"]
 
@@ -453,9 +453,9 @@ class DetectorGrid(Detector):
         if not return_pval:
             df = df.drop(columns=["P_value"])
 
-        # 6. Multiple testing correction (Benjamini-Hochberg) in place
+        # 6. Multiple testing correction (Benjamini-Hochberg)
         if return_pval:
-            _apply_bh_correction(df)
+            df["P_adj"] = apply_bh_correction(df["P_value"])
 
         return df.sort_values(by="Q", ascending=False)
 
@@ -671,6 +671,6 @@ class DetectorGrid(Detector):
         final_df = pd.concat(results_list, ignore_index=True)
 
         if return_pval and not final_df.empty:
-            _apply_bh_correction(final_df)
+            final_df["P_adj"] = apply_bh_correction(final_df["P_value"])
 
         return final_df.sort_values(by="R", key=abs, ascending=False)

@@ -75,7 +75,7 @@ from tqdm.auto import tqdm
 
 from quadsv.kernels.fft import power_spectrum_2d
 from quadsv.statistics import liu_sf
-from quadsv.utils import _apply_bh_correction
+from quadsv.utils import apply_bh_correction
 
 __all__ = [
     "compute_sample_spectrum",
@@ -2072,7 +2072,7 @@ def compare_two_groups(  # noqa: C901
                 "P_value_per_bin": list(per_bin_p),
             }
         )
-        _apply_bh_correction(df)
+        df["P_adj"] = apply_bh_correction(df["P_value"])
         df = df.sort_values("Statistic", ascending=False).reset_index(drop=True)
         if n_jobs != 1:  # noqa: PLR2004
             logger.debug("n_jobs ignored: per-statistic implementations are already vectorized.")
@@ -2084,7 +2084,7 @@ def compare_two_groups(  # noqa: C901
         if gene_names is None:
             gene_names = [str(i) for i in range(n_genes)]
         df = pd.DataFrame({"Feature": list(gene_names), "Statistic": observed, "P_value": pvals})
-        _apply_bh_correction(df)
+        df["P_adj"] = apply_bh_correction(df["P_value"])
         df = df.sort_values("Statistic", ascending=False).reset_index(drop=True)
         if n_jobs != 1:  # noqa: PLR2004
             logger.debug("n_jobs ignored: per-statistic implementations are already vectorized.")
@@ -2106,7 +2106,7 @@ def compare_two_groups(  # noqa: C901
     if gene_names is None:
         gene_names = [str(i) for i in range(n_genes)]
     df = pd.DataFrame({"Feature": list(gene_names), "Statistic": observed, "P_value": pvals})
-    _apply_bh_correction(df)
+    df["P_adj"] = apply_bh_correction(df["P_value"])
     df = df.sort_values("Statistic", ascending=False).reset_index(drop=True)
     if n_jobs != 1:  # noqa: PLR2004
         logger.debug("n_jobs ignored: per-statistic implementations are already vectorized.")
@@ -2274,9 +2274,7 @@ def compare_two_groups_masked(  # noqa: C901
         tested = df["P_value"].notna()
         df["P_adj"] = np.nan
         if tested.any():
-            sub_df = df.loc[tested, ["Feature", "P_value"]].copy()
-            _apply_bh_correction(sub_df)
-            df.loc[tested, "P_adj"] = sub_df["P_adj"].to_numpy()
+            df.loc[tested, "P_adj"] = apply_bh_correction(df.loc[tested, "P_value"])
         return df.sort_values("Statistic", ascending=False, na_position="last").reset_index(
             drop=True
         )
@@ -2330,9 +2328,7 @@ def compare_two_groups_masked(  # noqa: C901
     tested = df["P_value"].notna()
     df["P_adj"] = np.nan
     if tested.any():
-        sub_df = df.loc[tested, ["Feature", "P_value"]].copy()
-        _apply_bh_correction(sub_df)
-        df.loc[tested, "P_adj"] = sub_df["P_adj"].to_numpy()
+        df.loc[tested, "P_adj"] = apply_bh_correction(df.loc[tested, "P_value"])
     return df.sort_values("Statistic", ascending=False, na_position="last").reset_index(drop=True)
 
 
@@ -2448,7 +2444,7 @@ def compare_two_groups_scalar(
             "P_value": pvals,
         }
     )
-    _apply_bh_correction(df)
+    df["P_adj"] = apply_bh_correction(df["P_value"])
     return df.sort_values("Statistic", ascending=False).reset_index(drop=True)
 
 
@@ -2548,7 +2544,7 @@ def compare_glm(
     if gene_names is None:
         gene_names = [str(i) for i in range(n_genes)]
     df = pd.DataFrame({"Feature": list(gene_names), "Statistic": observed, "P_value": pvals})
-    _apply_bh_correction(df)
+    df["P_adj"] = apply_bh_correction(df["P_value"])
     df = df.sort_values("Statistic", ascending=False).reset_index(drop=True)
     return df
 

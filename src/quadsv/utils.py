@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import warnings
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -26,48 +27,61 @@ __all__ = [
     "visium_hex_spacing_um",
     "load_visium_sample",
     "visium_to_grid",
+    # Multiple testing
+    "apply_bh_correction",
 ]
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Benjamini–Hochberg (private; shared by detectors / comparators)
+# Benjamini-Hochberg correction
 # ---------------------------------------------------------------------------
 
 
-def _apply_bh_correction(df: pd.DataFrame) -> None:
-    """Apply Benjamini–Hochberg FDR correction to ``df['P_value']`` in place.
+def apply_bh_correction(p_values: np.ndarray | pd.Series | Sequence[float]) -> np.ndarray:
+    """Return Benjamini-Hochberg adjusted p-values for raw p-values.
 
-    Writes adjusted p-values into a new ``P_adj`` column. Non-finite p-values
-    (NaN / inf) are left as NaN. Shared helper used by
-    :class:`quadsv.DetectorIrregular`, :class:`quadsv.DetectorGrid`, and the
-    comparator pipeline.
+    Non-finite input values (NaN / inf) are ignored during correction and remain
+    ``NaN`` in the output. Finite raw p-values must lie in ``[0, 1]``. The
+    returned array preserves the input shape.
 
     Parameters
     ----------
-    df : pandas.DataFrame
-        Must contain a ``P_value`` column. Modified in place to add ``P_adj``.
+    p_values : array-like of float
+        Raw p-values to adjust.
+
+    Returns
+    -------
+    numpy.ndarray
+        Benjamini-Hochberg adjusted p-values with the same shape as
+        ``p_values``.
     """
-    pvals = df["P_value"].to_numpy()
-    valid_mask = np.isfinite(pvals)
+    pvals = np.asarray(p_values, dtype=float)
+    flat = pvals.ravel()
+    p_adj = np.full(flat.shape, np.nan, dtype=float)
+
+    valid_mask = np.isfinite(flat)
     m = valid_mask.sum()
     if m == 0:
-        return
+        return p_adj.reshape(pvals.shape)
 
-    p_sorted_idx = np.argsort(pvals[valid_mask])
-    p_sorted = pvals[valid_mask][p_sorted_idx]
+    valid_pvals = flat[valid_mask]
+    if np.any((valid_pvals < 0.0) | (valid_pvals > 1.0)):
+        raise ValueError("raw p-values must be finite values in [0, 1], or NaN/inf.")
+
+    p_sorted_idx = np.argsort(valid_pvals)
+    p_sorted = valid_pvals[p_sorted_idx]
     ranks = np.arange(1, m + 1)
 
     bh_vals = p_sorted * m / ranks
     bh_adj = np.minimum.accumulate(bh_vals[::-1])[::-1]
     bh_adj = np.clip(bh_adj, 0, 1)
 
-    p_adj = np.full_like(pvals, np.nan)
     p_adj_indices = np.where(valid_mask)[0][p_sorted_idx]
     p_adj[p_adj_indices] = bh_adj
 
-    df["P_adj"] = p_adj
+    return p_adj.reshape(pvals.shape)
 
 
 # ---------------------------------------------------------------------------
