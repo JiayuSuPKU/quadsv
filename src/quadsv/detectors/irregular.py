@@ -13,8 +13,7 @@ from tqdm import tqdm
 from quadsv.detectors.base import Detector
 from quadsv.kernels import Kernel, MatrixKernel
 from quadsv.kernels.nufft import NUFFTKernel, _standardize_features
-from quadsv.statistics import compute_null_params, spatial_q_test
-from quadsv.utils import apply_bh_correction
+from quadsv.statistics import apply_bh_correction, compute_null_params, spatial_q_test
 
 __all__ = ["DetectorIrregular"]
 

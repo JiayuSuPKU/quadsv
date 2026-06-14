@@ -19,8 +19,7 @@ from tqdm import tqdm
 
 from quadsv.detectors.base import Detector
 from quadsv.kernels.fft import FFTKernel
-from quadsv.statistics import spatial_q_test
-from quadsv.utils import apply_bh_correction
+from quadsv.statistics import apply_bh_correction, spatial_q_test
 
 __all__ = ["DetectorGrid"]
 

@@ -10,7 +10,7 @@ What this test enforces:
    ``__all__`` and missing documentation on new public symbols.
 3. **Canonical-path identity.** Top-level re-exports resolve to the
    *same* object as their canonical path (e.g.
-   ``quadsv.compute_null_params is quadsv.statistics.compute_null_params``).
+   ``quadsv.spatial_q_test is quadsv.statistics.spatial_q_test``).
    Guards against accidental re-export breakage during refactors.
 """
 
@@ -34,14 +34,6 @@ EXPECTED_ALL: list[str] = [
     # Statistical tests
     "spatial_q_test",
     "spatial_r_test",
-    # Statistical-test power-user helpers
-    "compute_null_params",
-    "auto_chunk_size",
-    "liu_sf",
-    # Effective-rank / spatial-pattern diversity
-    "effective_rank",
-    "gene_pattern_diversity",
-    "within_group_pattern_diversity",
     # Detectors
     "DetectorIrregular",
     "DetectorGrid",
@@ -98,12 +90,6 @@ _CANONICAL_PATHS: dict[str, tuple[str, str]] = {
     "NUFFTKernel": ("quadsv.kernels.nufft", "NUFFTKernel"),
     "spatial_q_test": ("quadsv.statistics", "spatial_q_test"),
     "spatial_r_test": ("quadsv.statistics", "spatial_r_test"),
-    "compute_null_params": ("quadsv.statistics", "compute_null_params"),
-    "auto_chunk_size": ("quadsv.statistics", "auto_chunk_size"),
-    "liu_sf": ("quadsv.statistics", "liu_sf"),
-    "effective_rank": ("quadsv.statistics", "effective_rank"),
-    "gene_pattern_diversity": ("quadsv.statistics", "gene_pattern_diversity"),
-    "within_group_pattern_diversity": ("quadsv.statistics", "within_group_pattern_diversity"),
     "DetectorIrregular": ("quadsv.detectors.irregular", "DetectorIrregular"),
     "DetectorGrid": ("quadsv.detectors.grid", "DetectorGrid"),
     "ComparatorIrregular": ("quadsv.comparators", "ComparatorIrregular"),
@@ -136,30 +122,3 @@ def test_backend_abcs_are_not_top_level_public():
         )
     # ...but the canonical path is still importable.
     from quadsv.kernels import Kernel, MatrixKernelBase  # noqa: F401
-
-
-# ---------------------------------------------------------------------------
-# Legacy-path shims (Stage 2) have been removed. Importing from
-# ``quadsv.fft``, ``quadsv.nufft``, ``quadsv.detector``,
-# ``quadsv.detector_grid``, ``quadsv._detector_base``, or
-# ``quadsv.multisample`` now raises ``ModuleNotFoundError`` — callers
-# must use the canonical paths under ``quadsv.kernels.*``,
-# ``quadsv.detectors.*``, and ``quadsv.comparators.multisample``.
-# ---------------------------------------------------------------------------
-_REMOVED_LEGACY_PATHS: list[str] = [
-    "quadsv.fft",
-    "quadsv.nufft",
-    "quadsv.detector",
-    "quadsv.detector_grid",
-    "quadsv._detector_base",
-    "quadsv.multisample",
-]
-
-
-def test_legacy_module_paths_no_longer_resolve():
-    """Importing a removed legacy path raises ``ModuleNotFoundError``."""
-    import pytest
-
-    for path in _REMOVED_LEGACY_PATHS:
-        with pytest.raises(ModuleNotFoundError):
-            importlib.import_module(path)

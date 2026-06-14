@@ -45,16 +45,7 @@ from quadsv.detectors.irregular import DetectorIrregular
 from quadsv.kernels import MatrixKernel
 from quadsv.kernels.fft import FFTKernel
 from quadsv.kernels.nufft import NUFFTKernel
-from quadsv.statistics import (
-    auto_chunk_size,
-    compute_null_params,
-    effective_rank,
-    gene_pattern_diversity,
-    liu_sf,
-    spatial_q_test,
-    spatial_r_test,
-    within_group_pattern_diversity,
-)
+from quadsv.statistics import spatial_q_test, spatial_r_test
 
 # The :class:`~quadsv.kernels.Kernel` and
 # :class:`~quadsv.kernels.MatrixKernelBase` ABCs are intentionally not
@@ -70,14 +61,6 @@ __all__ = [
     # Statistical tests
     "spatial_q_test",
     "spatial_r_test",
-    # Statistical-test power-user helpers (precompute-once, reuse-many-times)
-    "compute_null_params",
-    "auto_chunk_size",
-    "liu_sf",
-    # Effective-rank / spatial-pattern diversity
-    "effective_rank",
-    "gene_pattern_diversity",
-    "within_group_pattern_diversity",
     # Detectors
     "DetectorIrregular",
     "DetectorGrid",
