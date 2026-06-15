@@ -181,24 +181,10 @@ pytest tests/test_tutorials.py -v       # Run tutorial examples
 pip install -e ".[dev,docs]"            # Install dev + docs dependencies
 ```
 
-### Troubleshooting: pytest segfault or Numba cache error on Apple Silicon
-
-On macOS arm64, failures in an existing conda environment can come from native
-scientific dependencies loaded before `quadsv` code runs. One known trigger is
-`spatialdata` importing `xrspatial`, which decorates interpolation helpers with
-`numba.njit(cache=True)`. 
-
-When a Numba issue occurs, rerun pytest with Numba JIT disabled for local testing:
-
-```bash
-NUMBA_DISABLE_JIT=1 python -m pytest -q
-```
-
-If tests still segfault after the import issue is bypassed, check the environment for
-multiple OpenMP runtimes. A common bad state is loading both conda's
-`$CONDA_PREFIX/lib/libomp.dylib` through OpenBLAS and a vendored `libomp.dylib`
-from a PyPI wheel such as scikit-learn. To confirm whether the failure is environment-specific, 
-validate the package from a clean conda environment:
+### Troubleshooting
+Dependencies may be installed in a way that causes conflicts or unexpected behavior. 
+To confirm whether a failure is environment-specific, validate from a clean
+conda environment:
 
 ```bash
 conda create -n quadsv-test -c conda-forge python=3.12 pip -y
@@ -206,6 +192,45 @@ conda activate quadsv-test
 python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
+
+There are several known issues that may arise due to problematic environment configurations:
+
+#### Numba cache error during import
+This happens before any tests run, often through `spatialdata -> xrspatial`, where helpers are 
+decorated with `numba.njit(cache=True)`. The typical error is:
+
+```text
+RuntimeError: cannot cache function ... no locator available
+```
+
+To fix this, either point Numba at a writable cache directory via
+
+```bash
+mkdir -p /private/tmp/numba-cache
+NUMBA_CACHE_DIR=/private/tmp/numba-cache python -c 'import quadsv'
+```
+
+ or disable JIT to bypass the import-time cache path via
+
+```bash
+NUMBA_DISABLE_JIT=1 python -m pytest -q
+```
+
+#### Segfault during irregular NUFFT tests
+On macOS arm64, having multiple OpenMP runtimes in one environment can cause segfaults. 
+For example, when running `finufft.nufft2d1 -> Plan.setpts`, conda OpenBLAS may load
+ `$CONDA_PREFIX/lib/libomp.dylib` while the PyPI FINUFFT wheel may load
+`finufft/.dylibs/libomp.dylib`. 
+
+To fix this, either set the environment variable `KMP_DUPLICATE_LIB_OK=True`, which risks 
+introducing multithreading instability; or alternatively, use a single OpenMP runtime via
+
+```bash
+OMP_NUM_THREADS=1 python -m pytest -q
+```
+
+Longer-term, prefer a consistent conda-forge native stack so FINUFFT, OpenBLAS,
+NumPy/SciPy, and scikit-learn do not bring separate vendored OpenMP runtimes.
 
 ### Documentation
 [ReadTheDocs](https://quadsv.readthedocs.io/)
