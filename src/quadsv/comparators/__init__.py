@@ -21,9 +21,10 @@ test is available via a ``normalize_shape: bool = False`` keyword on
 :meth:`test_diff_freq` (forwarded to the standalone ``compare_*``
 function).
 
-The array-level primitives (spectrum compute, radial binning,
-rotation alignment, statistical tests) live in
-:mod:`quadsv.comparators.multisample`.
+The array-level spectral feature helpers live in
+:mod:`quadsv.comparators.features`; normalization primitives live in
+:mod:`quadsv.comparators.normalization`; statistical comparison
+primitives live in :mod:`quadsv.comparators.multisample`.
 """
 
 from quadsv.comparators.grid import ComparatorGrid

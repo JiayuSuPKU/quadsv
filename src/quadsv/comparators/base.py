@@ -6,11 +6,11 @@ This module hosts the private :class:`_ComparatorBase` mixin that
 inherit from. The mixin owns:
 
 - the ``compute_spectra`` driver that turns per-sample 2-D images
-  into the ``(n_samples, n_genes, K)`` ``spectra_`` tensor;
+  into the ``(n_samples, n_genes, n_feature_bins)`` ``spectra_`` tensor;
 - the chainable preprocessing methods ``normalize_background()`` and
   ``normalize_covariates(covariates)`` — thin wrappers around the
   same-named standalone functions in
-  :mod:`quadsv.comparators.multisample` that mutate ``spectra_`` in
+  :mod:`quadsv.comparators.normalization` that mutate ``spectra_`` in
   place;
 - the test methods ``test_diff_freq(design, ...)`` and
   ``test_diff_expr(design, ...)`` — design-at-call-time so a single
@@ -22,10 +22,6 @@ The shape-only / sum-1 feature representation is reached via the
 ``normalize_shape: bool = False`` keyword on :meth:`test_diff_freq`
 (forwarded to its dispatch target), not via a chainable method — this
 keeps the per-test choice non-destructive.
-
-The helpers ``_validate_common`` (constructor argument sanity) and
-``_validate_design`` (test-time ``design`` normalisation across 1-D
-arrays, 2-D ndarrays, and DataFrames) live at the bottom of the file.
 
 Concrete classes live in sibling modules:
 :mod:`quadsv.comparators.irregular` and
@@ -49,28 +45,33 @@ from tqdm.auto import tqdm
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*legacy Dask DataFrame.*")
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources is deprecated.*")
 
-from quadsv.comparators.multisample import (
-    compare_glm,
-    compare_two_groups,
-    compare_two_groups_masked,
-    compare_two_groups_scalar,
+from quadsv.comparators.features import (
     compute_sample_spectrum,
     radial_bin_spectrum,
     stream_polar_features,
 )
-from quadsv.comparators.multisample import (
-    # Aliased to leading-underscore names to avoid shadowing the
-    # like-named instance methods on the comparator class below.
-    normalize_background as _normalize_background,
-)
-from quadsv.comparators.multisample import (
-    normalize_covariates as _normalize_covariates,
-)
-from quadsv.statistics import (
+from quadsv.comparators.features import (
     gene_pattern_diversity as _gene_pattern_diversity,
 )
-from quadsv.statistics import (
+from quadsv.comparators.features import (
     within_group_pattern_diversity as _within_group_pattern_diversity,
+)
+from quadsv.comparators.multisample import (
+    compare_glm,
+    compare_glm_masked,
+    compare_glm_scalar,
+    compare_two_groups,
+    compare_two_groups_masked,
+    compare_two_groups_scalar,
+)
+
+# Aliased to leading-underscore names to avoid shadowing the like-named
+# instance methods on the comparator class below.
+from quadsv.comparators.normalization import (
+    normalize_background as _normalize_background,
+)
+from quadsv.comparators.normalization import (
+    normalize_covariates as _normalize_covariates,
 )
 
 __all__: list[str] = []
@@ -155,22 +156,24 @@ class _ComparatorBase:
     feature_mode : {'radial', '2d'}
         Spectral feature representation chosen at construction.
     freq_edges : np.ndarray | None
-        Shared radial-frequency bin edges (``len == n_radial_bins + 1``)
-        for the ``feature_mode='radial'`` path. Auto-derived during
-        :meth:`compute_spectra` if not supplied at construction.
+        Shared radial-frequency bin edges used by both feature modes.
+        Auto-derived during :meth:`compute_spectra` if not supplied at
+        construction.
 
     Public attributes set by :meth:`compute_spectra`
     -------------------------------------------------
     spectra_ : np.ndarray | None
-        Per-(sample, gene) radial-binned power spectrum, shape
-        ``(n_samples, n_genes, K_radial_bins)``. The headline feature
-        matrix; input to :meth:`test_diff_freq` and the in-place
+        Per-(sample, gene) spectral feature matrix, shape
+        ``(n_samples, n_genes, n_feature_bins)``. The trailing axis is
+        radial bins in ``feature_mode='radial'`` and flattened
+        ``radius × theta`` bins in ``feature_mode='2d'``. This is the
+        input to :meth:`test_diff_freq` and the in-place
         :meth:`normalize_background` / :meth:`normalize_covariates`
         preprocessing transforms.
     dc_ : np.ndarray | None
         DC component of the spectrum per (sample, gene), shape
         ``(n_samples, n_genes)``. Equals the sample-grid mean of each
-        gene's mean-centred expression. Input to :meth:`test_diff_expr`.
+        gene's uncentered expression. Input to :meth:`test_diff_expr`.
     presence_ : np.ndarray | None
         Boolean mask of shape ``(n_samples, n_genes)`` — ``True`` where
         a gene's per-sample spot-presence fraction cleared
@@ -182,7 +185,7 @@ class _ComparatorBase:
 
     Private state (set by subclasses; not part of the user API)
     -----------------------------------------------------------
-    ``_n_radial_bins``, ``_fft_solver``, ``_workers``,
+    ``_n_radial_bins``, ``_n_theta_bins``, ``_fft_solver``, ``_workers``,
     ``_presence_threshold``, ``_spacings``,
     ``_spectrum_fft_solver``, ``_grid_shapes``, ``_raw_2d_spectra``.
     """
@@ -211,9 +214,9 @@ class _ComparatorBase:
 
     _raw_2d_spectra: list[np.ndarray] | None = None
 
-    # Angular resolution of the ``feature_mode='2d'`` polar feature grid: the
-    # 2-D feature is ``(n_radial_bins radius × _n_theta_bins angle)`` over the half
-    # plane ``[0, π)``. Subclasses may override.
+    # Angular resolution of the ``feature_mode='2d'`` polar feature grid:
+    # the 2-D feature axis is ``n_radius_bins × _n_theta_bins`` over the
+    # half-plane ``[0, π)``. Subclasses may override.
     _n_theta_bins: int = 36
 
     # ------------------------------------------------------------------
@@ -232,22 +235,24 @@ class _ComparatorBase:
 
         - ``feature_mode='radial'`` — rasterise/NUFFT → per-gene-chunk FFT →
           radial-bin, discarding each dense chunk; ``feats`` are
-          **radial-binned** ``(n_genes, K)`` arrays. No alignment needed here,
-          and the ``landmark_genes`` argument is ignored.
+          **radial-binned** ``(n_genes, n_feature_bins)`` arrays. No alignment
+          needed here, and the ``landmark_genes`` argument is ignored.
         - ``feature_mode='2d'`` — a **two-pass** streamed rotation alignment:
           (A) learn per-sample rotation angles against a reference using
           landmark genes (default: use the per-sample *geometric-mean* spectrum as
-          a single landmark, like :func:`normalize_background`; optionally, align
+          a single landmark, like
+          :func:`quadsv.comparators.normalization.normalize_background`; optionally, align
           the spectra of an explicit ``landmark_genes`` set).
           (B) for every gene-chunk, first rotate by the estimated angle, then
           resample onto a polar ``(radius, theta)`` grid whose **radius axis is
           the shared physical-frequency grid** (:attr:`freq_edges`, the same
           edges the radial path uses) and whose ``theta`` axis (length
           :attr:`_n_theta_bins`) carries direction, and flatten — discarding each
-          dense chunk. ``feats`` are ``(n_genes, n_radial_bins · _n_theta_bins)`` and
-          are cross-sample aligned (heterogeneous lattices map the same physical
-          frequency to the same radius bin, like radial mode). The recovered
-          angles are stored on ``self.rotation_angles_``.
+          dense chunk. ``feats`` are
+          ``(n_genes, n_radius_bins · _n_theta_bins)`` and are cross-sample
+          aligned (heterogeneous lattices map the same physical frequency to
+          the same radius bin, like radial mode). The recovered angles are
+          stored on ``self.rotation_angles_``.
 
         ``dc`` is ``(n_samples, n_genes)`` and ``presence`` is
         ``(n_samples, n_genes)`` bool. Each backend calls
@@ -392,10 +397,10 @@ class _ComparatorBase:
         if self.freq_edges is not None or not self._spacings:
             return
 
-        # Find the minimum Nyquist frequency across all samples
+        # Find the minimum Nyquist frequency across all samples.
         nyquists = [1.0 / (2.0 * max(dy, dx)) for (dy, dx) in self._spacings]
         f_max = float(min(nyquists))
-        # Create the shared frequency edges
+        # Create the shared frequency edges.
         self.freq_edges = np.linspace(0.0, f_max * (1.0 + 1e-9), self._n_radial_bins + 1)
         logger.info(
             "Auto-generated %d radial bins on [0, %.4g] cycles per unit length.",
@@ -439,10 +444,10 @@ class _ComparatorBase:
             len(self.samples),
         )
         # ``_compute_spectra`` streams and returns the **final per-sample
-        # features** for both modes — radial-binned ``(n_genes, K)`` (radial), or
-        # rotation-aligned physical-frequency polar features
-        # ``(n_genes, n_radial_bins · _n_theta_bins)`` (2d). The dense full 2D spectra
-        # are never held; rotation angles (2d) are recorded on
+        # features** for both modes — radial-binned ``(n_genes, n_feature_bins)``
+        # (radial), or rotation-aligned physical-frequency polar features
+        # ``(n_genes, n_radius_bins · _n_theta_bins)`` (2d). The dense full 2D
+        # spectra are never held; rotation angles (2d) are recorded on
         # ``self.rotation_angles_`` by the backend.
         self._raw_2d_spectra = None
         per_sample, self.dc_, self.presence_ = self._compute_spectra(
@@ -450,8 +455,8 @@ class _ComparatorBase:
         )
 
         feats = list(per_sample)
-        K = min(f.shape[-1] for f in feats)
-        feats = [f[..., :K] for f in feats]
+        n_feature_bins = min(f.shape[-1] for f in feats)
+        feats = [f[..., :n_feature_bins] for f in feats]
         self.spectra_ = np.stack(feats, axis=0)
         return self
 
@@ -526,9 +531,9 @@ class _ComparatorBase:
           attached to the sample containers.
 
         Both modes produce the same downstream behaviour: per-sample
-        covariate features are reduced to ``(n_covariates, K)`` (same
-        ``K`` as :attr:`spectra_`) and passed through
-        :func:`~quadsv.comparators.multisample.normalize_covariates` to
+        covariate features are reduced to ``(n_covariates, n_feature_bins)``
+        (same trailing axis as :attr:`spectra_`) and passed through
+        :func:`~quadsv.comparators.normalization.normalize_covariates` to
         log-space-residualise each gene's spectrum against them.
 
         Parameters
@@ -584,7 +589,7 @@ class _ComparatorBase:
 
     # ------------------------------------------------------------------
     def _covariate_features_from_array(self, cov: np.ndarray, sample_index: int) -> np.ndarray:
-        """Image-array → ``(n_covariates, K)`` covariate features for one sample.
+        """Image-array → ``(n_covariates, n_feature_bins)`` covariate features.
 
         Shared by both subclasses for the pre-rasterized
         ``(n_covariates, ny, nx)`` input mode. Mirrors the spectrum +
@@ -634,7 +639,7 @@ class _ComparatorBase:
         )
 
     def _covariate_features_from_keys(self, keys: Sequence[str]) -> list[np.ndarray]:
-        """Column-key list → per-sample ``(n_covariates, K)`` covariate features.
+        """Column-key list → per-sample ``(n_covariates, n_feature_bins)`` features.
 
         Subclass hook. ``ComparatorIrregular`` reads ``adata.obs[key]``
         per sample (NUFFT directly on per-spot values), and
@@ -658,13 +663,14 @@ class _ComparatorBase:
         *,
         contrast: str | dict[str, float] | np.ndarray | None = None,
         statistic: str = "log_l2",
-        null: str = "wald",
+        null: str = "analytic",
         n_perm: int = 1000,
         random_state: int | None = None,
         freq_weights: np.ndarray | None = None,
-        n_perm_max: int = 10000,
+        max_exact_permutations: int = 10000,
         normalize_shape: bool = False,
         min_samples_per_group: int = 2,
+        min_resid_df: int = 1,
     ) -> Any:
         """Differential-frequency (DF) test on :attr:`spectra_`.
 
@@ -672,20 +678,22 @@ class _ComparatorBase:
         between conditions / along a contrast. The companion DE test is
         :meth:`test_diff_expr`.
 
-        Dispatches between three execution paths, picked from the
+        Dispatches between four execution paths, picked from the
         ``design`` argument's shape and the ``contrast=`` keyword:
 
-        - **Binary, Wald null** (1-D ``design``, ``null="wald"`` (default),
-          ``contrast=None``): analytic Wald test on the binary indicator
+        - **Binary, analytic null** (1-D ``design``, ``null="analytic"`` (default),
+          ``contrast=None``): Liu mixture-χ² test on the binary indicator
           via :func:`~quadsv.comparators.multisample.compare_two_groups`
           (or its masked variant when any ``presence_`` entry is
           ``False``).
         - **Binary, permutation null** (1-D ``design``,
           ``null="permutation"``, ``contrast=None``): two-group
           label-permutation test on the same dispatch target.
-        - **GLM Wald** (multi-column / continuous ``design`` **or**
-          explicit ``contrast=``): generalized analytic Wald test via
-          :func:`~quadsv.comparators.multisample.compare_glm`.
+        - **GLM analytic** (multi-column / continuous ``design`` **or**
+          explicit ``contrast=``): generalized Liu mixture-χ² test via
+          :func:`~quadsv.comparators.multisample.compare_glm` (or
+          :func:`~quadsv.comparators.multisample.compare_glm_masked`
+          when any ``presence_`` entry is ``False``).
 
         Supplying ``contrast=`` alongside a 1-D ``design`` switches to
         the GLM path on the single-column DataFrame that wraps the
@@ -707,13 +715,13 @@ class _ComparatorBase:
             Per-gene statistic. See
             :func:`~quadsv.comparators.multisample.compare_two_groups`
             for the catalog.
-        null : {'wald', 'permutation'}, default 'wald'
-            Null-distribution method. ``'wald'`` is the analytic
+        null : {'analytic', 'permutation'}, default 'analytic'
+            Null-distribution method. ``'analytic'`` is the analytic
             Liu-approximation null — the default on every dispatch
             path. ``'permutation'`` is available on the binary path
             only (raises on the GLM path).
-        n_perm, random_state, n_perm_max
-            Forwarded to the permutation path; ignored on the Wald
+        n_perm, random_state, max_exact_permutations
+            Forwarded to the permutation path; ignored on the analytic
             path.
         freq_weights : np.ndarray, optional
             Per-bin reweighting (same semantics as on the standalone).
@@ -730,6 +738,9 @@ class _ComparatorBase:
             the masked path (forwarded to
             :func:`~quadsv.comparators.multisample.compare_two_groups_masked`).
             Ignored on the unmasked / GLM paths.
+        min_resid_df : int, default 1
+            Minimum per-gene residual degrees of freedom required under
+            the masked GLM path. Ignored on the unmasked and binary paths.
 
         Notes
         -----
@@ -740,21 +751,30 @@ class _ComparatorBase:
         chainable :meth:`normalize_background` and
         :meth:`normalize_covariates` methods (no chainable equivalent
         for sum-1 normalisation — call this kwarg or the standalone
-        :func:`~quadsv.comparators.multisample.normalize_shape`).
+        :func:`~quadsv.comparators.normalization.normalize_shape`).
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .test_diff_freq().")
         if int(min_samples_per_group) < 2:
             raise ValueError(f"min_samples_per_group must be >= 2, got {min_samples_per_group}.")
+        if int(min_resid_df) < 1:
+            raise ValueError(f"min_resid_df must be >= 1, got {min_resid_df}.")
         groups, design_obj = _validate_design(design, len(self.samples))
+        use_masked = self.presence_ is not None and not self.presence_.all()
 
         use_glm = (contrast is not None) or (groups is None)
         if use_glm:
-            if null != "wald":
-                raise NotImplementedError(
-                    "Only null='wald' is supported when "
+            if statistic != "log_l2":
+                raise ValueError(
+                    "Only statistic='log_l2' is supported when "
                     "contrast= is provided or `design` is a multi-column / "
-                    "continuous design. Pass null='wald' or pass a 1-D "
+                    f"continuous design, got statistic={statistic!r}."
+                )
+            if null != "analytic":
+                raise NotImplementedError(
+                    "Only null='analytic' is supported when "
+                    "contrast= is provided or `design` is a multi-column / "
+                    "continuous design. Pass null='analytic' or pass a 1-D "
                     "binary `design` (and omit `contrast=`) to take the "
                     "permutation path."
                 )
@@ -763,19 +783,27 @@ class _ComparatorBase:
                     "test_diff_freq() requires `contrast=` when `design` is "
                     "a multi-column / continuous design."
                 )
+            if use_masked:
+                return compare_glm_masked(
+                    self.spectra_,
+                    design_obj,
+                    contrast,
+                    self.presence_,
+                    gene_names=self.gene_names,
+                    freq_weights=freq_weights,
+                    normalize_shape=normalize_shape,
+                    min_resid_df=int(min_resid_df),
+                )
             return compare_glm(
                 self.spectra_,
                 design_obj,
                 contrast,
                 gene_names=self.gene_names,
-                statistic=statistic,
-                null=null,
                 freq_weights=freq_weights,
                 normalize_shape=normalize_shape,
             )
 
         # Binary path (1-D design, contrast is None).
-        use_masked = self.presence_ is not None and not self.presence_.all()
         if use_masked:
             return compare_two_groups_masked(
                 self.spectra_,
@@ -788,7 +816,7 @@ class _ComparatorBase:
                 random_state=random_state,
                 min_samples_per_group=int(min_samples_per_group),
                 freq_weights=freq_weights,
-                n_perm_max=n_perm_max,
+                max_exact_permutations=max_exact_permutations,
                 normalize_shape=normalize_shape,
             )
         return compare_two_groups(
@@ -800,7 +828,7 @@ class _ComparatorBase:
             n_perm=n_perm,
             random_state=random_state,
             freq_weights=freq_weights,
-            n_perm_max=n_perm_max,
+            max_exact_permutations=max_exact_permutations,
             normalize_shape=normalize_shape,
         )
 
@@ -808,55 +836,63 @@ class _ComparatorBase:
         self,
         design: Any,
         *,
-        null: str = "wald",
-        n_perm: int = 1000,
-        random_state: int | None = None,
-        n_perm_max: int = 10000,
+        contrast: str | dict[str, float] | np.ndarray | None = None,
+        log_expression: bool = False,
+        eps: float = 1e-12,
     ) -> Any:
         """Differential-expression (DE) test on the DC component.
 
         Per-gene two-sided test on the per-sample DC scalars (the grid
         mean of each sample's per-gene expression), routed through
-        :func:`~quadsv.comparators.multisample.compare_two_groups_scalar`.
-        The companion DF test is :meth:`test_diff_freq`.
-
-        Currently the binary-contrast path only — ``design`` must be a
-        1-D array / Series of binary labels.
+        :func:`~quadsv.comparators.multisample.compare_two_groups_scalar`
+        for 1-D binary designs, or through
+        :func:`~quadsv.comparators.multisample.compare_glm_scalar` when
+        ``contrast=`` is supplied or ``design`` is a DataFrame / 2-D matrix.
+        The binary path uses Welch t statistics with Welch-Satterthwaite
+        t-distribution p-values; the GLM path uses OLS contrast t statistics
+        with Student t-distribution p-values. The companion DF test is
+        :meth:`test_diff_freq`.
 
         Parameters
         ----------
-        design : 1-D array or pandas.Series
-            Binary group labels (length ``len(samples)``). Multi-column
-            / continuous designs are not yet supported for the DC test;
-            use a downstream tool (e.g. :func:`scanpy.tl.rank_genes_groups`)
-            on :attr:`dc_` directly for those cases.
-        null : {'wald', 'permutation'}, default 'wald'
-            Null-distribution method. Forwarded to
-            :func:`~quadsv.comparators.multisample.compare_two_groups_scalar`.
-            ``'wald'`` (default) returns analytic Welch-Satterthwaite t
-            p-values; ``'permutation'`` runs a label-shuffle null.
-        n_perm, random_state, n_perm_max
-            Ignored when ``null='wald'``; forwarded otherwise.
+        design : 1-D array, pandas.Series, pandas.DataFrame, or 2-D ndarray
+            Binary group labels for the two-group path, or a GLM design matrix
+            when ``contrast=`` is supplied.
+        contrast : str, dict, or ndarray, optional
+            Linear contrast for a multi-column / continuous design. Required
+            unless ``design`` is a 1-D binary vector and the two-group path is
+            desired.
+        log_expression : bool, default False
+            If True, run the scalar test on ``log(dc + eps)`` rather than raw
+            DC means. Applies to both the binary two-group path and the GLM
+            path.
+        eps : float, default 1e-12
+            Additive offset used only when ``log_expression=True``.
         """
         if self.dc_ is None:
             raise RuntimeError("Call .compute_spectra() before .test_diff_expr().")
-        groups, _ = _validate_design(design, len(self.samples))
-        if groups is None:
-            raise NotImplementedError(
-                "test_diff_expr() currently requires a 1-D binary `design`. "
-                "The DC-component DE test does not yet support a general / "
-                "multi-column design; use a downstream tool (e.g., "
-                "scanpy.tl.rank_genes_groups) on the per-sample DC values "
-                "for now."
+        groups, design_obj = _validate_design(design, len(self.samples))
+        use_glm = (contrast is not None) or (groups is None)
+        if use_glm:
+            if contrast is None:
+                raise ValueError(
+                    "test_diff_expr() requires `contrast=` when `design` is "
+                    "a multi-column / continuous design."
+                )
+            return compare_glm_scalar(
+                self.dc_,
+                design_obj,
+                contrast,
+                gene_names=self.gene_names,
+                log_expression=log_expression,
+                eps=eps,
             )
         return compare_two_groups_scalar(
             self.dc_,
             groups,
             gene_names=self.gene_names,
-            null=null,
-            n_perm=n_perm,
-            random_state=random_state,
-            n_perm_max=n_perm_max,
+            log_expression=log_expression,
+            eps=eps,
         )
 
     def effective_rank(
@@ -871,7 +907,7 @@ class _ComparatorBase:
         Quantifies how concentrated the spatial-frequency content is along
         the eigen-directions of the relevant covariance matrix.
         ``K_eff = (Σλ)² / Σλ²`` — bounded by 1 (rank-1, all power on a
-        single direction → Wald test reduces to a 1-DoF test) and ``K``
+        single direction → analytic test reduces to a 1-DoF test) and ``K``
         (uniformly spread, Liu's CLT smoothing is most accurate).
 
         Parameters
@@ -885,7 +921,7 @@ class _ComparatorBase:
 
             ``'within_group'``: returns a single ``K_eff`` for the pooled
             within-group covariance (the same Σ used by ``log_l2 +
-            null='wald'``). Useful for diagnosing whether the analytic
+            null='analytic'``). Useful for diagnosing whether the analytic
             null should be trusted on this cohort. Requires ``design=``
             with a 1-D binary array.
         design : 1-D array, optional
@@ -954,9 +990,9 @@ def _validate_design(  # noqa: C901 — dispatch over three input shapes is esse
     -------
     groups : np.ndarray | None
         ``(n_samples,)`` 1-D array iff the user supplied a 1-D binary
-        input; ``None`` otherwise. Drives the binary
-        permutation-/Wald-test dispatch in :meth:`test_diff_freq` and
-        gates :meth:`test_diff_expr`.
+        input; ``None`` otherwise. Drives the binary two-group dispatch
+        in :meth:`test_diff_freq` and :meth:`test_diff_expr`; ``None``
+        selects the GLM path.
     design : pandas.DataFrame | np.ndarray
         Normalised design. Always a ``DataFrame`` for the 1-D and
         DataFrame inputs; a 2-D ``ndarray`` is returned as-is.

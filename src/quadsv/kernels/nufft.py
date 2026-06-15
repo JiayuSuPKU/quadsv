@@ -16,7 +16,7 @@ evaluates the type-1 NUFFT
 on the same uniform ``(ny, nx)`` k-space grid that :func:`power_spectrum_2d`
 would produce for a rasterized input of the same physical extent, and returns
 :math:`|\\hat c|^2` in the scipy FFT layout (DC at ``[0, 0]``). Anything
-downstream — :func:`quadsv.comparators.multisample.radial_bin_spectrum`,
+downstream — :func:`quadsv.comparators.features.radial_bin_spectrum`,
 :class:`quadsv.ComparatorIrregular` — works identically.
 
 Notation (shared across this module)

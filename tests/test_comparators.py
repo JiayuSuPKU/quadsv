@@ -19,10 +19,14 @@ from geopandas import GeoDataFrame
 from spatialdata.models import ShapesModel, TableModel
 
 from quadsv.comparators import ComparatorGrid, ComparatorIrregular
-from quadsv.comparators.multisample import compare_two_groups
+from quadsv.comparators.multisample import (
+    compare_glm_masked,
+    compare_glm_scalar,
+    compare_two_groups,
+    compare_two_groups_scalar,
+)
 
-# ``compare_two_groups`` is the oracle for wrapper-level tests that verify
-# comparator methods delegate correctly without mutating comparator state.
+# Standalone comparison helpers are the oracles for wrapper-level dispatch tests.
 
 
 class _ArraySelection:
@@ -253,7 +257,7 @@ class TestComparatorGridFeatures:
         assert cmp._grid_shapes == [(8, 10), (10, 8)]
         assert cmp._spacings == spacings
         assert 8 <= cmp._fft_chunk_size <= cmp._auto_chunk_cap
-        assert cmp.spectra_.shape == (2, 3, 4)
+        assert cmp.spectra_.shape == (2, 3, 5)
         expected_f_max = min(1.0 / (2.0 * max(dy, dx)) for dy, dx in spacings)
         assert cmp.freq_edges[-1] == pytest.approx(expected_f_max * (1.0 + 1e-9))
 
@@ -417,7 +421,7 @@ class TestComparatorIrregularFeatures:
         assert 8 <= cmp._nufft_chunk_size <= cmp._auto_chunk_cap
 
         cmp.compute_spectra(n_jobs=1, progress=False)
-        assert cmp.spectra_.shape == (2, 3, 5)
+        assert cmp.spectra_.shape == (2, 3, 6)
         expected_f_max = min(1.0 / (2.0 * max(dy, dx)) for dy, dx in spacings)
         assert cmp.freq_edges[-1] == pytest.approx(expected_f_max * (1.0 + 1e-9))
 
@@ -652,6 +656,19 @@ class TestComparatorIrregularWorkflow:
         with pytest.raises(RuntimeError, match=r"\.compute_spectra\(\)"):
             cmp.test_diff_freq(np.array([0, 1]))
 
+    def test_diff_freq_glm_rejects_binary_only_selectors(self):
+        gene_names = ["a", "b"]
+        samples = [np.ones((2, 4, 4)) * (i + 1.0) for i in range(4)]
+        cmp = ComparatorIrregular(
+            _grid_samples_to_adata(samples, gene_names), gene_names
+        ).compute_spectra(progress=False)
+        design = pd.DataFrame({"x": np.arange(4, dtype=float)})
+
+        with pytest.raises(ValueError, match="statistic='log_l2'"):
+            cmp.test_diff_freq(design, contrast="x", statistic="welch_t_cauchy")
+        with pytest.raises(NotImplementedError, match="null='analytic'"):
+            cmp.test_diff_freq(design, contrast="x", null="permutation")
+
 
 class TestComparatorIrregularNormalizeCovariates:
     """Comparator-level covariate normalization input modes."""
@@ -754,6 +771,79 @@ class TestComparatorIrregularDcAccess:
         with pytest.raises(RuntimeError, match=r"\.compute_spectra\(\)"):
             cmp.test_diff_expr(np.array([0, 1]))
 
+    def test_diff_expr_supports_glm_scalar_design(self):
+        rng = np.random.default_rng(4)
+        x = np.linspace(0.0, 1.0, 8)
+        gene_names = ["g0", "g1", "g2"]
+        samples = []
+        for xi in x:
+            sample = 0.05 * rng.standard_normal((3, 6, 6))
+            sample[0] += 2.0 * xi
+            samples.append(sample)
+        cmp = ComparatorIrregular(
+            _grid_samples_to_adata(samples, gene_names),
+            gene_names=gene_names,
+        ).compute_spectra(progress=False)
+
+        df = cmp.test_diff_expr(pd.DataFrame({"dose": x}), contrast="dose")
+
+        assert df.iloc[0]["Feature"] == "g0"
+        assert df.iloc[0]["Estimate"] > 1.0
+        assert df.iloc[0]["P_value"] < 0.01
+
+    def test_diff_expr_log_expression_applies_to_two_group_path(self):
+        gene_names = ["g0", "g1"]
+        groups = np.array([0, 0, 1, 1])
+        dc_values = np.array(
+            [
+                [1.0, 2.0],
+                [1.2, 1.9],
+                [2.4, 2.1],
+                [2.6, 2.0],
+            ]
+        )
+        samples = [np.array([np.full((6, 6), value) for value in row]) for row in dc_values]
+        cmp = ComparatorIrregular(
+            _grid_samples_to_adata(samples, gene_names),
+            gene_names=gene_names,
+        ).compute_spectra(progress=False)
+
+        df = cmp.test_diff_expr(groups, log_expression=True)
+        expected = compare_two_groups_scalar(
+            np.log(cmp.dc_ + 1e-12),
+            groups,
+            gene_names=gene_names,
+        )
+
+        df = df.sort_values("Feature").reset_index(drop=True)
+        expected = expected.sort_values("Feature").reset_index(drop=True)
+        np.testing.assert_allclose(df["Mean_diff"], expected["Mean_diff"], rtol=1e-12)
+        np.testing.assert_allclose(df["P_value"], expected["P_value"], rtol=1e-12)
+
+    def test_diff_expr_log_expression_applies_to_glm_path(self):
+        gene_names = ["g0", "g1"]
+        x = np.linspace(0.0, 1.0, 6)
+        dc_values = np.column_stack([np.exp(1.0 + 0.8 * x), np.exp(1.5 + 0.05 * x)])
+        samples = [np.array([np.full((6, 6), value) for value in row]) for row in dc_values]
+        cmp = ComparatorIrregular(
+            _grid_samples_to_adata(samples, gene_names),
+            gene_names=gene_names,
+        ).compute_spectra(progress=False)
+        design = pd.DataFrame({"dose": x})
+
+        df = cmp.test_diff_expr(design, contrast="dose", log_expression=True)
+        expected = compare_glm_scalar(
+            np.log(cmp.dc_ + 1e-12),
+            design,
+            "dose",
+            gene_names=gene_names,
+        )
+
+        df = df.sort_values("Feature").reset_index(drop=True)
+        expected = expected.sort_values("Feature").reset_index(drop=True)
+        np.testing.assert_allclose(df["Estimate"], expected["Estimate"], rtol=1e-12)
+        np.testing.assert_allclose(df["P_value"], expected["P_value"], rtol=1e-12)
+
 
 class TestComparatorIrregularDcPatternSeparation:
     """Mean shifts should affect expression tests without driving pattern tests."""
@@ -779,7 +869,7 @@ class TestComparatorIrregularDcPatternSeparation:
             n_radial_bins=8,
         ).compute_spectra(progress=False)
 
-        de = cmp.test_diff_expr(groups, n_perm=400, random_state=0)
+        de = cmp.test_diff_expr(groups)
         pattern_df = cmp.test_diff_freq(groups, n_perm=400, random_state=0)
 
         de_g0 = de.set_index("Feature").loc["g0"]
@@ -805,14 +895,16 @@ class TestComparatorIrregularNormalizeShape:
             .normalize_background()
         )
         before = cmp.spectra_.copy()
-        df_kw = cmp.test_diff_freq(groups, statistic="log_l2", null="wald", normalize_shape=True)
+        df_kw = cmp.test_diff_freq(
+            groups, statistic="log_l2", null="analytic", normalize_shape=True
+        )
         # The lower-level helper is the oracle for wrapper dispatch correctness.
         df_manual = compare_two_groups(
             cmp.spectra_,
             groups,
             gene_names=cmp.gene_names,
             statistic="log_l2",
-            null="wald",
+            null="analytic",
             normalize_shape=True,
         )
         df_kw = df_kw.sort_values("Feature").reset_index(drop=True)
@@ -862,6 +954,47 @@ class TestComparatorIrregularIncompleteData:
         assert cmp.presence_[2, 0]
         df = cmp.test_diff_freq(groups, statistic="log_l2", n_perm=20, random_state=0)
         assert {"n_obs_A", "n_obs_B"}.issubset(df.columns)
+
+    def test_presence_threshold_uses_masked_glm_comparison(self):
+        rng = np.random.default_rng(1)
+        ny = nx = 12
+        gene_names = ["g0", "g1", "g2"]
+        coords = (
+            np.stack(np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij"), axis=-1)
+            .reshape(-1, 2)
+            .astype(float)
+        )
+        samples = []
+        for _ in range(6):
+            X = rng.uniform(0.1, 1.0, size=(ny * nx, 3))
+            a = ad.AnnData(X=X)
+            a.var_names = gene_names
+            a.obsm["spatial"] = coords
+            samples.append(a)
+        for i in (0, 1):
+            samples[i].X[:, 0] = 0.0
+
+        design = pd.DataFrame({"time": np.linspace(0.0, 1.0, 6)})
+        cmp = ComparatorIrregular(
+            samples,
+            gene_names,
+            presence_threshold=0.5,
+        ).compute_spectra(progress=False)
+
+        df = cmp.test_diff_freq(design, contrast="time", statistic="log_l2")
+        expected = compare_glm_masked(
+            cmp.spectra_,
+            design,
+            "time",
+            cmp.presence_,
+            gene_names=cmp.gene_names,
+        )
+
+        assert {"n_obs", "df_resid"}.issubset(df.columns)
+        pd.testing.assert_frame_equal(
+            df.sort_values("Feature").reset_index(drop=True),
+            expected.sort_values("Feature").reset_index(drop=True),
+        )
 
 
 class TestComparatorIrregularApiUnification:

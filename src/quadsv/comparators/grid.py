@@ -25,7 +25,7 @@ from quadsv.comparators.base import (
     _unpack_sample_quads,
     _validate_common,
 )
-from quadsv.comparators.multisample import (
+from quadsv.comparators.features import (
     compute_sample_spectrum,
     estimate_rotations_from_landmarks,
     stream_geomean_landmark,
@@ -71,14 +71,15 @@ class ComparatorGrid(_ComparatorBase):
         share ``var_names``.
     feature_mode : {'radial', '2d'}, default 'radial'
     n_radial_bins : int, default 30
-        Number of radial frequency edges minus one. With the default DC
-        exclusion, radial mode returns ``n_radial_bins - 1`` columns.
+        Number of radial frequency intervals used when ``freq_edges`` is not
+        supplied. Radial mode excludes only the DC cell from the first interval,
+        so the automatic radial feature count is ``n_radial_bins``.
     n_theta_bins : int, default 36
         Number of angular bins on the half-plane ``[0, π)`` for
-        ``feature_mode='2d'``. Ignored by radial mode. 2D features have
-        ``n_radial_bins * n_theta_bins`` columns unless explicit
-        ``freq_edges`` are supplied, in which case the radius count is
-        ``len(freq_edges) - 1``.
+        ``feature_mode='2d'``. Ignored by radial mode. The 2D feature
+        count is ``n_radius_bins * n_theta_bins``, where
+        ``n_radius_bins = len(freq_edges) - 1`` (or ``n_radial_bins`` when
+        edges are auto-generated).
     fft_chunk_size : int or 'auto', default 'auto'
         Genes per chunk. The rasterised image is always kept **lazy** (dask)
         and materialised one ``chunk``-gene block at a time, FFT'd, and
@@ -94,13 +95,13 @@ class ComparatorGrid(_ComparatorBase):
         to :meth:`compute_spectra`.
 
     spacing : (dy, dx) or sequence of (dy, dx), optional
-        Physical pitch of one rasterised bin, in micrometers.
-        ``rasterize_bins`` emits one pixel per bin, so this maps the pixel lattice to
-        physical frequency units (cycles per bin / um).
+        Physical pitch of one rasterised bin. ``rasterize_bins`` emits one
+        pixel per bin, so this maps the pixel lattice to physical frequency
+        units (for example cycles/μm when spacing is in μm).
         Pass a single ``(dy, dx)`` to apply to all samples, or one ``(dy, dx)``
         per sample (length ``n_samples``) so that sections with different bin pitches
         still bin onto a common physical frequency grid.
-        Defaults to ``(1.0, 1.0)`` (cycles per bin / um).
+        Defaults to ``(1.0, 1.0)`` (cycles per raster bin).
 
     Other Parameters
     ----------------

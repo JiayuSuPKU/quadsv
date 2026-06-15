@@ -19,7 +19,7 @@ from quadsv.comparators.base import (
     _unpack_sample_triples,
     _validate_common,
 )
-from quadsv.comparators.multisample import (
+from quadsv.comparators.features import (
     estimate_rotations_from_landmarks,
     radial_bin_spectrum,
     stream_geomean_landmark,
@@ -56,14 +56,15 @@ class ComparatorIrregular(_ComparatorBase):
         the same ``var_names``.
     feature_mode : {'radial', '2d'}, default 'radial'
     n_radial_bins : int, default 30
-        Number of radial frequency edges minus one. With the default DC
-        exclusion, radial mode returns ``n_radial_bins - 1`` columns.
+        Number of radial frequency intervals used when ``freq_edges`` is not
+        supplied. Radial mode excludes only the DC cell from the first interval,
+        so the automatic radial feature count is ``n_radial_bins``.
     n_theta_bins : int, default 36
         Number of angular bins on the half-plane ``[0, π)`` for
-        ``feature_mode='2d'``. Ignored by radial mode. 2D features have
-        ``n_radial_bins * n_theta_bins`` columns unless explicit
-        ``freq_edges`` are supplied, in which case the radius count is
-        ``len(freq_edges) - 1``.
+        ``feature_mode='2d'``. Ignored by radial mode. The 2D feature
+        count is ``n_radius_bins * n_theta_bins``, where
+        ``n_radius_bins = len(freq_edges) - 1`` (or ``n_radial_bins`` when
+        edges are auto-generated).
     obsm_key : str, default 'spatial'. Key for the spatial coordinates in ``obsm``.
     layer : str, optional
     unit_scales : sequence of float, optional
@@ -92,11 +93,11 @@ class ComparatorIrregular(_ComparatorBase):
         Explicit shared radial-frequency bin edges. When supplied, these edges
         are used as-is for all samples and override the automatic
         ``[0, min Nyquist]`` construction. Edges must be in the same units as
-        ``spacing``. With the default DC exclusion, radial output has
-        ``len(freq_edges) - 2`` columns; otherwise the automatic
-        ``n_radial_bins + 1`` edges produce ``n_radial_bins - 1`` radial
-        columns. In ``feature_mode='2d'``, the number of radius bins is
-        ``len(freq_edges) - 1`` and the feature axis has
+        ``spacing``. With the default DC exclusion, only the zero-frequency cell
+        is removed before bin averaging, so radial output has
+        ``len(freq_edges) - 1`` columns; automatic edges produce
+        ``n_radial_bins`` radial columns. In ``feature_mode='2d'``, the number
+        of radius bins is ``len(freq_edges) - 1`` and the feature axis has
         ``(len(freq_edges) - 1) * n_theta_bins`` columns.
     eps : float, default 1e-6
         NUFFT tolerance.
@@ -451,7 +452,7 @@ class ComparatorIrregular(_ComparatorBase):
         everywhere") — anything else is treated as a schema mismatch.
 
         For each sample the resolved per-spot vectors are stacked into
-        an ``(n_obs, n_covariates)`` block, mean-centred per column,
+        an ``(n_obs, n_covariates)`` block, mean-centered per column,
         and NUFFTed directly onto the sample's k-grid. The 2-D spectra
         are then radial-binned with the same edges as the gene panel.
 

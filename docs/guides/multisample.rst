@@ -7,10 +7,10 @@ ask which genes show the biggest spatial-pattern difference between
 the groups. The :class:`~quadsv.ComparatorIrregular` and
 :class:`~quadsv.ComparatorGrid` classes give you a frequency-domain
 pipeline that does this without spatial registration. The default
-null is an analytic Liu-approximation Wald test (``null="wald"``);
+null is an analytic Wald test (``null="analytic"``);
 a label-permutation null is available on the binary path with
 ``null="permutation"``. The GLM (multi-column / continuous design)
-path is Wald-only.
+path is analytic-only.
 
 .. note::
 
@@ -59,9 +59,8 @@ Five-step pipeline
    The **DC scalar** is the per-sample grid mean, i.e. total
    normalised expression. It is tested across groups with
    :meth:`~quadsv.ComparatorIrregular.test_diff_expr`, which runs
-   an analytic Welch-Satterthwaite t-test by default
-   (``null="wald"``; ``null="permutation"`` is also available) with
-   BH-FDR. This is a spatially-aware differential-expression test.
+   an analytic Welch-Satterthwaite t-test with BH-FDR. This is a
+   spatially-agnostic differential-expression test.
 
    The **AC spectrum** is the pattern shape, with DC exactly zero.
    It is tested with
@@ -85,9 +84,9 @@ common dispatch, so they are directly comparable:
      - What it measures
    * - ``log_l2`` (default)
      - Quadratic form ``T² = D'WD`` on log-spectra differences.
-       Supports analytic ``null="wald"`` (Liu mixture-χ² tail; the
+       Supports analytic ``null="analytic"`` (Liu mixture-χ² tail; the
        default on :meth:`~quadsv.ComparatorIrregular.test_diff_freq`)
-       and ``null="permutation"`` on the binary path. The Wald null
+       and ``null="permutation"`` on the binary path. The analytic null
        bypasses the BH-FDR floor that the exact permutation test
        hits at small per-arm n, and is the only path that works on
        multi-column / continuous designs.
@@ -190,7 +189,7 @@ carries a low-frequency stripe pattern in group 1 only.
        .compute_spectra()
        .normalize_background()
    )
-   # Default null="wald" → analytic Liu-approximation Wald test.
+   # Default null="analytic" → analytic Liu mixture test.
    # Add null="permutation", n_perm=300, random_state=0 for the
    # label-permutation alternative.
    results = cmp.test_diff_freq(design, statistic="log_l2")
