@@ -16,7 +16,7 @@ inherit from. The mixin owns:
   ``test_diff_expr(design, ...)`` — design-at-call-time so a single
   fitted comparator can serve any number of unrelated contrasts on
   the same spectra;
-- the diagnostic ``effective_rank(level=..., design=...)``.
+- the diagnostic ``effective_rank()``.
 
 The shape-only / sum-1 feature representation is reached via the
 ``normalize_shape: bool = False`` keyword on :meth:`test_diff_freq`
@@ -35,7 +35,7 @@ import logging
 import warnings
 from abc import abstractmethod
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from joblib import Parallel, delayed
@@ -53,10 +53,11 @@ from quadsv.comparators.features import (
 from quadsv.comparators.features import (
     gene_pattern_diversity as _gene_pattern_diversity,
 )
-from quadsv.comparators.features import (
-    within_group_pattern_diversity as _within_group_pattern_diversity,
-)
 from quadsv.comparators.multisample import (
+    _estimate_glm_masked_null_covariance,
+    _estimate_glm_null_covariance,
+    _estimate_two_group_masked_null_covariance,
+    _estimate_two_group_null_covariance,
     compare_glm,
     compare_glm_masked,
     compare_glm_scalar,
@@ -73,6 +74,9 @@ from quadsv.comparators.normalization import (
 from quadsv.comparators.normalization import (
     normalize_covariates as _normalize_covariates,
 )
+
+if TYPE_CHECKING:
+    from quadsv.comparators.multisample import _AnalyticNullState
 
 __all__: list[str] = []
 
@@ -832,6 +836,104 @@ class _ComparatorBase:
             normalize_shape=normalize_shape,
         )
 
+    def estimate_null_covariance(
+        self,
+        design: Any,
+        *,
+        contrast: str | dict[str, float] | np.ndarray | None = None,
+        freq_weights: np.ndarray | None = None,
+        normalize_shape: bool = False,
+        min_samples_per_group: int = 2,
+        min_resid_df: int = 1,
+    ) -> _AnalyticNullState:
+        """Estimate the analytic ``log_l2`` null covariance for inspection.
+
+        This method follows the same binary-vs-GLM and masked-vs-unmasked
+        dispatch rules as :meth:`test_diff_freq`, but returns the covariance
+        diagnostics used by the analytic Liu mixture null instead of running a
+        test. It is intentionally call-scoped: different designs, contrasts,
+        masks, frequency weights, or ``normalize_shape`` choices imply different
+        covariance estimates.
+
+        Parameters
+        ----------
+        design : 1-D array, 2-D ndarray, or pandas.DataFrame
+            Same design argument accepted by :meth:`test_diff_freq`.
+        contrast : str, dict, or ndarray, optional
+            Required for GLM designs, or to force a 1-D binary design through
+            the GLM path.
+        freq_weights : np.ndarray, optional
+            Per-bin weights used to form ``weighted_cov = W^1/2 Sigma W^1/2``.
+        normalize_shape : bool, default False
+            Apply non-destructive shape normalization before estimating
+            covariance, matching :meth:`test_diff_freq(normalize_shape=True)`.
+        min_samples_per_group : int, default 2
+            Minimum observed samples per arm for masked binary designs.
+        min_resid_df : int, default 1
+            Minimum per-gene residual df for masked GLM designs.
+
+        Returns
+        -------
+        dict
+            Analytic-null state with common keys ``mode``, ``masked``,
+            ``observed``, ``sigma_log``, ``freq_weights``, ``weighted_cov``,
+            ``eigenvalues``, ``effective_rank``, ``contrast_scale``,
+            ``df_resid``, and ``eligible``.
+
+            Two-group-only metadata: ``n_obs_A`` and ``n_obs_B``.
+            GLM-only metadata: ``design_columns``, ``contrast_vector``,
+            fitted ``beta`` coefficients, and ``n_obs``.
+        """
+        if self.spectra_ is None:
+            raise RuntimeError("Call .compute_spectra() before .estimate_null_covariance().")
+        if int(min_samples_per_group) < 2:
+            raise ValueError(f"min_samples_per_group must be >= 2, got {min_samples_per_group}.")
+        if int(min_resid_df) < 1:
+            raise ValueError(f"min_resid_df must be >= 1, got {min_resid_df}.")
+
+        groups, design_obj = _validate_design(design, len(self.samples))
+        use_masked = self.presence_ is not None and not self.presence_.all()
+        use_glm = (contrast is not None) or (groups is None)
+        if use_glm:
+            if contrast is None:
+                raise ValueError(
+                    "estimate_null_covariance() requires `contrast=` when "
+                    "`design` is a multi-column / continuous design."
+                )
+            if use_masked:
+                return _estimate_glm_masked_null_covariance(
+                    self.spectra_,
+                    design_obj,
+                    contrast,
+                    self.presence_,
+                    freq_weights=freq_weights,
+                    normalize_shape=normalize_shape,
+                    min_resid_df=int(min_resid_df),
+                )
+            return _estimate_glm_null_covariance(
+                self.spectra_,
+                design_obj,
+                contrast,
+                freq_weights=freq_weights,
+                normalize_shape=normalize_shape,
+            )
+
+        if use_masked:
+            return _estimate_two_group_masked_null_covariance(
+                self.spectra_,
+                groups,
+                self.presence_,
+                freq_weights=freq_weights,
+                normalize_shape=normalize_shape,
+                min_samples_per_group=int(min_samples_per_group),
+            )
+        return _estimate_two_group_null_covariance(
+            self.spectra_,
+            groups,
+            freq_weights=freq_weights,
+            normalize_shape=normalize_shape,
+        )
+
     def test_diff_expr(
         self,
         design: Any,
@@ -895,38 +997,16 @@ class _ComparatorBase:
             eps=eps,
         )
 
-    def effective_rank(
-        self,
-        level: str = "per_sample",
-        *,
-        design: Any | None = None,
-        weights: np.ndarray | None = None,
-    ) -> float | np.ndarray:
-        """Effective rank ``K_eff`` of the spectrum covariance.
+    def effective_rank(self, *, weights: np.ndarray | None = None) -> np.ndarray:
+        """Per-sample effective rank ``K_eff`` of the gene-spectrum covariance.
 
         Quantifies how concentrated the spatial-frequency content is along
-        the eigen-directions of the relevant covariance matrix.
+        the eigen-directions of each sample's cross-gene-spectrum covariance matrix.
         ``K_eff = (Σλ)² / Σλ²`` — bounded by 1 (rank-1, all power on a
-        single direction → analytic test reduces to a 1-DoF test) and ``K``
-        (uniformly spread, Liu's CLT smoothing is most accurate).
+        single direction) and ``n_feature_bins`` (uniformly spread).
 
         Parameters
         ----------
-        level : {'per_sample', 'within_group'}, default 'per_sample'
-            ``'per_sample'``: returns an ``(n_samples,)`` array — the
-            effective rank of each sample's gene-wise spectrum
-            covariance. High variability across samples means
-            sample-to-sample heterogeneity in spatial-pattern structure,
-            which is a separate concern from cross-condition difference.
-
-            ``'within_group'``: returns a single ``K_eff`` for the pooled
-            within-group covariance (the same Σ used by ``log_l2 +
-            null='analytic'``). Useful for diagnosing whether the analytic
-            null should be trusted on this cohort. Requires ``design=``
-            with a 1-D binary array.
-        design : 1-D array, optional
-            Binary group labels (length ``len(samples)``). Required for
-            ``level='within_group'``; ignored otherwise.
         weights : np.ndarray, optional
             Per-bin weights (same semantics as ``freq_weights``). When
             given, returns the effective rank of
@@ -935,30 +1015,14 @@ class _ComparatorBase:
 
         Returns
         -------
-        float (when ``level='within_group'``) or np.ndarray of shape
-        ``(n_samples,)`` (when ``level='per_sample'``).
+        np.ndarray of shape ``(n_samples,)``.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .effective_rank().")
-        if level == "within_group":
-            if design is None:
-                raise ValueError("level='within_group' requires `design=` (1-D binary).")
-            groups, _ = _validate_design(design, len(self.samples))
-            if groups is None:
-                raise ValueError(
-                    "level='within_group' requires a 1-D binary `design=`. "
-                    "Use level='per_sample' for a multi-column design."
-                )
-            return _within_group_pattern_diversity(self.spectra_, groups, weights=weights)
-        if level == "per_sample":
-            n_samples = self.spectra_.shape[0]
-            return np.array(
-                [
-                    _gene_pattern_diversity(self.spectra_[i], weights=weights)
-                    for i in range(n_samples)
-                ]
-            )
-        raise ValueError(f"level must be 'within_group' or 'per_sample', got {level!r}.")
+        n_samples = self.spectra_.shape[0]
+        return np.array(
+            [_gene_pattern_diversity(self.spectra_[i], weights=weights) for i in range(n_samples)]
+        )
 
 
 # ---------------------------------------------------------------------------

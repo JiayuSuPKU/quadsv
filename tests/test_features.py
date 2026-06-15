@@ -17,7 +17,6 @@ from quadsv.comparators.features import (
     stream_geomean_landmark,
     stream_polar_features,
     stream_radial_features,
-    within_group_pattern_diversity,
 )
 from quadsv.kernels.fft import power_spectrum_2d
 
@@ -173,18 +172,6 @@ class TestPatternDiversity:
 
         assert gene_pattern_diversity(spectra_rank1) < 1.5
         assert gene_pattern_diversity(spectra_iid) > K * 0.5
-
-    def test_within_group_pattern_diversity_real_data_like(self):
-        """Within-group diversity should distinguish rank-1 from iid spectra."""
-        rng = np.random.default_rng(3)
-        n_a, n_b, G, K = 4, 4, 800, 20
-        scalar = rng.standard_normal((n_a + n_b, G, 1))
-        spectra = np.exp(scalar)
-        groups = np.array([0] * n_a + [1] * n_b)
-        spectra_iid = np.exp(rng.standard_normal((n_a + n_b, G, K)))
-
-        assert within_group_pattern_diversity(spectra, groups) < 2.0
-        assert within_group_pattern_diversity(spectra_iid, groups) > K * 0.5
 
 
 class TestRadialBinning:

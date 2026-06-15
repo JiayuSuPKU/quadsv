@@ -36,15 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is computed, so the test fires only on shape-only redistribution
   of power across radial frequencies. Statistic-agnostic; default
   False preserves prior behaviour.
-- **Effective-rank diagnostics** for the within-group covariance
-  used by the analytic `log_l2` null:
-  `quadsv.comparators.features.effective_rank(cov, weights=None)`
-  primitive (`K_eff = (Σλ)² / Σλ²`),
-  `quadsv.comparators.features.gene_pattern_diversity(spectra)`
-  for per-sample heterogeneity,
-  `quadsv.comparators.features.within_group_pattern_diversity(spectra, groups)`
-  for cohort-level, and a chainable `Comparator.effective_rank(level=…)`
-  accessor.
+- **Comparator null-covariance and effective-rank diagnostics**:
+  `Comparator.effective_rank(weights=None)` for per-sample heterogeneity 
+  in the gene spectrum cross-frequency covariance; 
+  `Comparator.estimate_null_covariance(design, contrast=...)`for the
+  pooled log-spectrum covariance, weighted covariance, scaled Liu
+  eigenvalues, effective rank, residual df, and masked-path eligibility
+  metadata used by `test_diff_freq(..., statistic="log_l2", null="analytic")`.
 - **Top-level convenience exports**:
   `quadsv.Detector(data, …)` and `quadsv.Comparator(data_list, …)`
   factories that dispatch on `AnnData` vs `SpatialData`;
@@ -112,9 +110,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: `design` moved from Comparator constructor to test
   time.** The cross-sample contrast is no longer a construction
   argument — it is supplied directly to `.test_diff_freq(design, ...)`
-  / `.test_diff_expr(design, ...)` (positional first arg), and to
-  `.effective_rank(level="within_group", design=...)` for the
-  group-conditioned diagnostic. A single fitted comparator can now
+  / `.test_diff_expr(design, ...)` (positional first arg). A single fitted comparator can now
   serve any number of unrelated contrasts on the same `spectra_`
   without recomputing per-sample spectra. `min_samples_per_group`
   follows `design` to `test_diff_freq` (kwarg) since it's a property

@@ -25,6 +25,7 @@ from quadsv.comparators.multisample import (
     compare_two_groups,
     compare_two_groups_scalar,
 )
+from quadsv.statistics import liu_sf
 
 # Standalone comparison helpers are the oracles for wrapper-level dispatch tests.
 
@@ -95,6 +96,21 @@ def _grid_samples_to_adata(samples, gene_names, spacings=None):
     return [
         _grid_sample_to_adata(s, gene_names, spacing=spacings[i]) for i, s in enumerate(samples)
     ]
+
+
+def _comparator_from_spectra(
+    spectra: np.ndarray,
+    presence: np.ndarray | None = None,
+) -> ComparatorIrregular:
+    """Build a comparator around synthetic spectra without running FFTs."""
+
+    n_samples, n_genes, _ = spectra.shape
+    gene_names = [f"g{i}" for i in range(n_genes)]
+    zero_grids = [np.zeros((n_genes, 2, 2), dtype=float) for _ in range(n_samples)]
+    cmp = ComparatorIrregular(_grid_samples_to_adata(zero_grids, gene_names), gene_names)
+    cmp.spectra_ = spectra
+    cmp.presence_ = presence
+    return cmp
 
 
 def _make_bin_sdata(
@@ -559,30 +575,7 @@ class TestComparatorIrregularDesign:
 class TestComparatorIrregularEffectiveRank:
     """Comparator-level accessors for effective-rank summaries."""
 
-    def test_effective_rank_within_group(self):
-        rng = np.random.default_rng(4)
-        n_per = 4
-        adatas = [
-            _grid_sample_to_adata(
-                rng.uniform(size=(200, 8, 8)),
-                gene_names=[f"g{j}" for j in range(200)],
-            )
-            for _ in range(2 * n_per)
-        ]
-        groups = np.array([0] * n_per + [1] * n_per)
-        cmp = ComparatorIrregular(
-            adatas,
-            gene_names=[f"g{j}" for j in range(200)],
-            feature_mode="radial",
-            n_radial_bins=15,
-            presence_threshold=0.0,
-        )
-        cmp.compute_spectra(n_jobs=1, progress=False)
-        ke = cmp.effective_rank(level="within_group", design=groups)
-        assert isinstance(ke, float)
-        assert 1.0 - 1e-9 <= ke <= 15.0 + 1e-9
-
-    def test_effective_rank_per_sample(self):
+    def test_effective_rank_returns_per_sample_values(self):
         rng = np.random.default_rng(5)
         n_per = 3
         n_total = 2 * n_per
@@ -601,7 +594,7 @@ class TestComparatorIrregularEffectiveRank:
             presence_threshold=0.0,
         )
         cmp.compute_spectra(n_jobs=1, progress=False)
-        ke_arr = cmp.effective_rank(level="per_sample")
+        ke_arr = cmp.effective_rank()
         assert ke_arr.shape == (n_total,)
         assert np.all(ke_arr >= 1.0 - 1e-9)
         assert np.all(ke_arr <= 12.0 + 1e-9)
@@ -668,6 +661,146 @@ class TestComparatorIrregularWorkflow:
             cmp.test_diff_freq(design, contrast="x", statistic="welch_t_cauchy")
         with pytest.raises(NotImplementedError, match="null='analytic'"):
             cmp.test_diff_freq(design, contrast="x", null="permutation")
+
+
+class TestComparatorNullCovariance:
+    """Covariance diagnostics should reproduce analytic ``test_diff_freq`` p-values."""
+
+    common_state_keys = {
+        "mode",
+        "masked",
+        "observed",
+        "sigma_log",
+        "freq_weights",
+        "weighted_cov",
+        "eigenvalues",
+        "effective_rank",
+        "contrast_scale",
+        "df_resid",
+        "eligible",
+    }
+
+    @staticmethod
+    def _assert_diag_reproduces_pvalues(
+        cmp: ComparatorIrregular,
+        df: pd.DataFrame,
+        diag: dict[str, object],
+    ) -> None:
+        """Check Liu eigenvalues returned by diagnostics against reported p-values."""
+
+        assert TestComparatorNullCovariance.common_state_keys <= set(diag)
+        observed = np.asarray(diag["observed"], dtype=float)
+        eigenvalues = np.asarray(diag["eigenvalues"], dtype=float)
+        eligible = np.asarray(diag["eligible"], dtype=bool)
+        assert observed.shape == (len(cmp.gene_names),)
+        assert eligible.shape == (len(cmp.gene_names),)
+
+        for row in df.itertuples(index=False):
+            gene_idx = cmp.gene_names.index(row.Feature)
+            if not np.isfinite(row.P_value):
+                assert not eligible[gene_idx]
+                continue
+
+            lambs = eigenvalues if eigenvalues.ndim == 1 else eigenvalues[gene_idx]
+            expected = liu_sf(np.array([row.Statistic * row.Statistic]), lambs)[0]
+            assert row.P_value == pytest.approx(expected)
+
+    def test_two_group_covariance_reproduces_analytic_pvalues(self):
+        rng = np.random.default_rng(20)
+        spectra = np.exp(rng.normal(size=(6, 8, 5)))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        weights = np.arange(1, spectra.shape[-1] + 1, dtype=float)
+        cmp = _comparator_from_spectra(spectra)
+
+        diag = cmp.estimate_null_covariance(
+            groups,
+            freq_weights=weights,
+            normalize_shape=True,
+        )
+        df = cmp.test_diff_freq(
+            groups,
+            freq_weights=weights,
+            normalize_shape=True,
+        )
+
+        assert diag["mode"] == "two_group"
+        assert not diag["masked"]
+        assert diag["sigma_log"].shape == (5, 5)
+        assert diag["df_resid"] == 4
+        assert {"n_obs_A", "n_obs_B"} <= set(diag)
+        assert "design_columns" not in diag
+        assert 1.0 <= diag["effective_rank"] <= 5.0
+        self._assert_diag_reproduces_pvalues(cmp, df, diag)
+
+    def test_glm_covariance_reproduces_analytic_pvalues(self):
+        rng = np.random.default_rng(21)
+        spectra = np.exp(rng.normal(size=(7, 6, 4)))
+        design = pd.DataFrame({"time": np.linspace(0.0, 1.0, spectra.shape[0])})
+        cmp = _comparator_from_spectra(spectra)
+
+        diag = cmp.estimate_null_covariance(design, contrast="time")
+        df = cmp.test_diff_freq(design, contrast="time")
+
+        assert diag["mode"] == "glm"
+        assert not diag["masked"]
+        assert diag["df_resid"] == 5
+        assert diag["design_columns"] == ["Intercept", "time"]
+        assert {"contrast_vector", "beta", "n_obs"} <= set(diag)
+        assert np.asarray(diag["beta"]).shape == (2, 6, 4)
+        assert "n_obs_A" not in diag
+        assert 1.0 <= diag["effective_rank"] <= 4.0
+        self._assert_diag_reproduces_pvalues(cmp, df, diag)
+
+    def test_masked_two_group_covariance_reproduces_analytic_pvalues(self):
+        rng = np.random.default_rng(22)
+        spectra = np.exp(rng.normal(size=(6, 5, 4)))
+        groups = np.array([0, 0, 0, 1, 1, 1])
+        presence = np.ones((6, 5), dtype=bool)
+        presence[3:, 0] = False
+        cmp = _comparator_from_spectra(spectra, presence=presence)
+
+        diag = cmp.estimate_null_covariance(groups)
+        df = cmp.test_diff_freq(groups)
+
+        assert diag["mode"] == "two_group"
+        assert diag["masked"]
+        assert not diag["eligible"][0]
+        assert diag["eigenvalues"].shape == (5, 4)
+        assert {"n_obs_A", "n_obs_B"} <= set(diag)
+        assert 1.0 <= diag["effective_rank"] <= 4.0
+        self._assert_diag_reproduces_pvalues(cmp, df, diag)
+
+    def test_masked_glm_covariance_reproduces_analytic_pvalues(self):
+        rng = np.random.default_rng(23)
+        spectra = np.exp(rng.normal(size=(6, 5, 4)))
+        design = pd.DataFrame({"time": np.linspace(0.0, 1.0, spectra.shape[0])})
+        presence = np.ones((6, 5), dtype=bool)
+        presence[1:, 0] = False
+        cmp = _comparator_from_spectra(spectra, presence=presence)
+
+        diag = cmp.estimate_null_covariance(design, contrast="time")
+        df = cmp.test_diff_freq(design, contrast="time")
+
+        assert diag["mode"] == "glm"
+        assert diag["masked"]
+        assert not diag["eligible"][0]
+        assert diag["eigenvalues"].shape == (5, 4)
+        assert {"contrast_vector", "design_columns", "beta", "n_obs"} <= set(diag)
+        beta = np.asarray(diag["beta"])
+        assert beta.shape == (2, 5, 4)
+        assert np.isnan(beta[:, 0, :]).all()
+        assert np.isfinite(beta[:, np.asarray(diag["eligible"], dtype=bool), :]).all()
+        assert "n_obs_A" not in diag
+        assert 1.0 <= diag["effective_rank"] <= 4.0
+        self._assert_diag_reproduces_pvalues(cmp, df, diag)
+
+    def test_covariance_requires_computed_spectra(self):
+        gene_names = ["a", "b"]
+        adatas = _grid_samples_to_adata([np.zeros((2, 4, 4)), np.zeros((2, 4, 4))], gene_names)
+        cmp = ComparatorIrregular(adatas, gene_names)
+
+        with pytest.raises(RuntimeError, match=r"\.compute_spectra\(\)"):
+            cmp.estimate_null_covariance(np.array([0, 1]))
 
 
 class TestComparatorIrregularNormalizeCovariates:
@@ -855,9 +988,7 @@ class TestComparatorIrregularDcPatternSeparation:
         n_genes = 6
         pattern = rng.standard_normal((n_genes, ny, nx))
 
-        samples = [
-            pattern + 0.05 * rng.standard_normal((n_genes, ny, nx)) for _ in range(2 * n_per)
-        ]
+        samples = [pattern + 0.5 * rng.standard_normal((n_genes, ny, nx)) for _ in range(2 * n_per)]
         for i in range(n_per, 2 * n_per):
             samples[i][0] += 10.0
 
@@ -870,7 +1001,10 @@ class TestComparatorIrregularDcPatternSeparation:
         ).compute_spectra(progress=False)
 
         de = cmp.test_diff_expr(groups)
-        pattern_df = cmp.test_diff_freq(groups, n_perm=400, random_state=0)
+        pattern_df = cmp.test_diff_freq(
+            groups,
+            null="analytic",
+        )
 
         de_g0 = de.set_index("Feature").loc["g0"]
         pat_g0 = pattern_df.set_index("Feature").loc["g0"]

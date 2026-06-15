@@ -11,7 +11,7 @@ Subpackage grouping the layer-4 public classes:
 
 Both classes share the same post-``compute_spectra`` surface
 (``normalize_background``, ``normalize_covariates``,
-``test_diff_freq``, ``test_diff_expr``, ``effective_rank``) through
+``test_diff_freq``, ``test_diff_expr``) through
 the private :class:`~quadsv.comparators.base._ComparatorBase` mixin.
 Cross-sample contrasts are supplied at test time via the ``design``
 argument on the test methods — the comparator itself is

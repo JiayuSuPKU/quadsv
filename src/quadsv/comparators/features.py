@@ -12,9 +12,8 @@ them to cross-sample features. This module owns those array-level operations:
   orientation.
 - :func:`power_spectrum_anisotropy` reports a compact second-angular-moment
   diagnostic for raw 2-D spectra before radial collapse.
-- :func:`effective_rank`, :func:`gene_pattern_diversity`, and
-  :func:`within_group_pattern_diversity` summarize how many independent
-  frequency directions contribute to observed pattern variation.
+- :func:`effective_rank` and :func:`gene_pattern_diversity` summarize how many
+  independent frequency directions contribute to observed pattern variation.
 
 All helpers are pure array transforms. Container handling, covariate lookup,
 and statistical tests live in the comparator backends and
@@ -42,7 +41,6 @@ __all__ = [
     "stream_radial_features",
     "stream_geomean_landmark",
     "stream_polar_features",
-    "within_group_pattern_diversity",
     "estimate_rotations_from_landmarks",
     "apply_rotations_to_spectra",
     "align_spectra_by_rotation",
@@ -430,69 +428,6 @@ def gene_pattern_diversity(
     G = log_s.shape[0]
     cov = (centred.T @ centred) / max(G - 1, 1)
     return effective_rank(cov, weights=weights)
-
-
-def within_group_pattern_diversity(
-    spectra: np.ndarray,
-    groups: np.ndarray,
-    weights: np.ndarray | None = None,
-    *,
-    eps: float = 1e-12,
-) -> float:
-    r"""Spatial-pattern diversity of the within-group residual covariance.
-
-    For a cohort of samples partitioned into two groups, computes the
-    pooled-across-genes within-group covariance of log-spectra
-    (the same estimator used by ``log_l2 + null='analytic'`` in the
-    comparator), then returns its effective rank.
-
-    Interpretation:
-
-    - **Low diversity** (:math:`K_\mathrm{eff} \approx 1`): within-group
-      sample-to-sample variation aligns with one spatial-frequency
-      direction. Analytic tests on this cohort effectively reduce to a
-      1-DoF test → high power per direction but very sensitive to
-      estimation noise in that single eigenvalue.
-    - **High diversity** (:math:`K_\mathrm{eff} \approx K`): noise
-      spreads over many directions; Liu's analytic null is more
-      accurate (CLT smoothing).
-
-    Parameters
-    ----------
-    spectra : np.ndarray
-        ``(n_samples, n_genes, n_bins)`` spectrum tensor (raw, not logged).
-    groups : np.ndarray
-        ``(n_samples,)`` with exactly two distinct labels.
-    weights : np.ndarray, optional
-        Per-bin weights, same semantics as :func:`effective_rank`.
-    eps : float, default 1e-12
-        Floor for ``log(spectra)``.
-
-    Returns
-    -------
-    float
-        Effective rank of the pooled within-group covariance.
-    """
-    if spectra.ndim != 3:
-        raise ValueError(
-            f"spectra must be (n_samples, n_genes, n_bins), got shape {spectra.shape}."
-        )
-    groups = np.asarray(groups)
-    uniq = np.unique(groups)
-    if uniq.size != 2:
-        raise ValueError(f"groups must contain exactly two distinct labels, got {uniq}.")
-    g_int = (groups == uniq[1]).astype(int)
-    a_mask = g_int == 0
-    log_a = np.log(np.maximum(spectra[a_mask], eps))
-    log_b = np.log(np.maximum(spectra[~a_mask], eps))
-    res_a = log_a - log_a.mean(axis=0, keepdims=True)
-    res_b = log_b - log_b.mean(axis=0, keepdims=True)
-    res = np.concatenate([res_a, res_b], axis=0)
-    n_total, n_genes, n_bins = res.shape
-    df = max(int(a_mask.sum()) + int((~a_mask).sum()) - 2, 1)
-    res_flat = res.reshape(n_total * n_genes, n_bins)
-    Sigma = (res_flat.T @ res_flat) / (n_genes * df)
-    return effective_rank(Sigma, weights=weights)
 
 
 def radial_bin_spectrum(
