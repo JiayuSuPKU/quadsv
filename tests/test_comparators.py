@@ -19,6 +19,7 @@ from geopandas import GeoDataFrame
 from spatialdata.models import ShapesModel, TableModel
 
 from quadsv.comparators import ComparatorGrid, ComparatorIrregular
+from quadsv.comparators.features import radial_bin_spectrum
 from quadsv.comparators.multisample import (
     compare_glm_masked,
     compare_glm_scalar,
@@ -273,7 +274,11 @@ class TestComparatorGridFeatures:
         assert cmp._grid_shapes == [(8, 10), (10, 8)]
         assert cmp._spacings == spacings
         assert 8 <= cmp._fft_chunk_size <= cmp._auto_chunk_cap
-        assert cmp.spectra_.shape == (2, 3, 5)
+        assert cmp.freq_edges_requested_.shape == (6,)
+        assert cmp.frequency_bin_counts_.shape == (2, cmp.freq_edges_requested_.size - 1)
+        assert cmp.frequency_bin_intervals_.shape == (cmp.spectra_.shape[-1], 2)
+        assert cmp.spectra_.shape == (2, 3, cmp.frequency_bin_intervals_.shape[0])
+        assert cmp.spectra_.shape[-1] <= 5
         expected_f_max = min(1.0 / (2.0 * max(dy, dx)) for dy, dx in spacings)
         assert cmp.freq_edges[-1] == pytest.approx(expected_f_max * (1.0 + 1e-9))
 
@@ -308,7 +313,10 @@ class TestComparatorGridFeatures:
         assert cmp.rotation_angles_.shape == (2,)
         assert cmp.rotation_angles_[0] == pytest.approx(0.0)
         assert cmp._raw_2d_spectra is None
-        assert cmp.spectra_.shape == (2, 3, 4 * 8)
+        assert cmp.freq_edges_requested_.shape == (5,)
+        assert cmp.frequency_bin_counts_.shape == (2, cmp.freq_edges_requested_.size - 1)
+        assert cmp.frequency_bin_intervals_.shape[0] <= 4
+        assert cmp.spectra_.shape == (2, 3, cmp.frequency_bin_intervals_.shape[0] * 8)
         assert np.isfinite(cmp.spectra_).all()
 
     def test_radial_and_2d_use_sample_parallel_dispatch(self, monkeypatch):
@@ -437,9 +445,106 @@ class TestComparatorIrregularFeatures:
         assert 8 <= cmp._nufft_chunk_size <= cmp._auto_chunk_cap
 
         cmp.compute_spectra(n_jobs=1, progress=False)
-        assert cmp.spectra_.shape == (2, 3, 6)
+        assert cmp.freq_edges_requested_.shape == (7,)
+        assert cmp.frequency_bin_counts_.shape == (2, cmp.freq_edges_requested_.size - 1)
+        assert cmp.frequency_bin_intervals_.shape == (cmp.spectra_.shape[-1], 2)
+        assert cmp.spectra_.shape == (2, 3, cmp.frequency_bin_intervals_.shape[0])
+        assert cmp.spectra_.shape[-1] <= 6
         expected_f_max = min(1.0 / (2.0 * max(dy, dx)) for dy, dx in spacings)
         assert cmp.freq_edges[-1] == pytest.approx(expected_f_max * (1.0 + 1e-9))
+
+    def test_empty_frequency_bins_are_nan_then_dropped_or_merged(self):
+        rng = np.random.default_rng(11)
+        gene_names = ["g0", "g1"]
+        samples = [
+            rng.standard_normal((2, 32, 32)),
+            rng.standard_normal((2, 9, 9)),
+        ]
+        adatas = _grid_samples_to_adata(samples, gene_names)
+        grid_shapes = [(32, 32), (9, 9)]
+        spacings = [(1.0, 1.0), (1.0, 1.0)]
+
+        fixed = ComparatorIrregular(
+            adatas,
+            gene_names=gene_names,
+            feature_mode="radial",
+            grid_shape=grid_shapes,
+            spacing=spacings,
+            n_radial_bins=8,
+            adaptive_freq_edges=False,
+        ).compute_spectra(n_jobs=1, progress=False)
+
+        raw_small = radial_bin_spectrum(
+            np.ones((2, 9, 9), dtype=float),
+            grid_shape=(9, 9),
+            n_bins=8,
+            fft_solver="fft2",
+            spacing=(1.0, 1.0),
+            edges=fixed.freq_edges,
+        )
+        assert np.isnan(raw_small[:, 0]).all()
+
+        n_kept = fixed.frequency_bin_intervals_.shape[0]
+        assert fixed.spectra_.shape == (2, 2, n_kept)
+        assert n_kept < 8
+        assert fixed.freq_edges_requested_.shape == (9,)
+        assert fixed.frequency_bin_counts_.shape == (2, fixed.freq_edges_requested_.size - 1)
+        assert np.any(fixed.frequency_bin_counts_ == 0)
+        assert fixed.frequency_bin_intervals_.shape == (n_kept, 2)
+        assert fixed.frequency_bin_intervals_[0, 0] > fixed.freq_edges_requested_[0]
+        assert np.isfinite(fixed.spectra_).all()
+
+        adaptive = ComparatorIrregular(
+            adatas,
+            gene_names=gene_names,
+            feature_mode="radial",
+            grid_shape=grid_shapes,
+            spacing=spacings,
+            n_radial_bins=8,
+            adaptive_freq_edges=True,
+        ).compute_spectra(n_jobs=1, progress=False)
+
+        assert adaptive.spectra_.shape[-1] < 8
+        assert adaptive.spectra_.shape[-1] == adaptive.freq_edges.size - 1
+        assert adaptive.freq_edges_requested_.shape == (9,)
+        assert adaptive.frequency_bin_counts_.shape == (
+            2,
+            adaptive.freq_edges_requested_.size - 1,
+        )
+        assert np.any(adaptive.frequency_bin_counts_ == 0)
+        assert adaptive.frequency_bin_intervals_.shape == (adaptive.spectra_.shape[-1], 2)
+        np.testing.assert_allclose(
+            adaptive.frequency_bin_intervals_[:, 0], adaptive.freq_edges[:-1]
+        )
+        np.testing.assert_allclose(adaptive.frequency_bin_intervals_[:, 1], adaptive.freq_edges[1:])
+
+    def test_2d_empty_radial_bins_drop_entire_theta_block(self):
+        rng = np.random.default_rng(12)
+        gene_names = ["g0", "g1"]
+        samples = [
+            rng.standard_normal((2, 32, 32)),
+            rng.standard_normal((2, 9, 9)),
+        ]
+        adatas = _grid_samples_to_adata(samples, gene_names)
+        n_theta = 5
+
+        cmp = ComparatorIrregular(
+            adatas,
+            gene_names=gene_names,
+            feature_mode="2d",
+            grid_shape=[(32, 32), (9, 9)],
+            spacing=[(1.0, 1.0), (1.0, 1.0)],
+            n_radial_bins=8,
+            n_theta_bins=n_theta,
+            adaptive_freq_edges=False,
+        ).compute_spectra(n_jobs=1, landmark_genes=["g0"], progress=False)
+
+        n_kept = cmp.frequency_bin_intervals_.shape[0]
+        assert cmp.frequency_bin_counts_.shape == (2, cmp.freq_edges_requested_.size - 1)
+        assert np.any(cmp.frequency_bin_counts_ == 0)
+        assert n_kept < 8
+        assert cmp.spectra_.shape == (2, 2, n_kept * n_theta)
+        assert np.isfinite(cmp.spectra_).all()
 
     def test_2d_auto_chunk_with_per_sample_grid_spacing(self):
         rng = np.random.default_rng(3)
@@ -635,10 +740,11 @@ class TestComparatorIrregularWorkflow:
         ny = nx = 16
         gene_names = [f"g{i}" for i in range(4)]
         samples = [rng.standard_normal((4, ny, nx)) for _ in range(2 * n_per)]
-        covariates = [rng.standard_normal((1, ny, nx)) for _ in range(2 * n_per)]
         groups = np.array([0] * n_per + [1] * n_per)
         cmp = ComparatorIrregular(_grid_samples_to_adata(samples, gene_names), gene_names)
-        cmp.compute_spectra(progress=False).normalize_covariates(covariates)
+        cmp.compute_spectra(progress=False)
+        covariates = [rng.standard_normal((1, *shape)) for shape in cmp._grid_shapes]
+        cmp.normalize_covariates(covariates)
         df = cmp.test_diff_freq(groups, statistic="log_l2", n_perm=50, random_state=0)
         assert df.shape[0] == 4
 
@@ -865,9 +971,17 @@ class TestComparatorIrregularNormalizeCovariates:
         samples = self._build_samples()
         cmp = ComparatorIrregular(samples).compute_spectra(progress=False).normalize_background()
         before = cmp.spectra_.copy()
-        arrays = [rng.standard_normal((1, 8, 8)) for _ in samples]
+        arrays = [rng.standard_normal((1, *shape)) for shape in cmp._grid_shapes]
         cmp.normalize_covariates(arrays)
         assert not np.array_equal(cmp.spectra_, before)
+
+    def test_array_covariates_require_supported_frequency_bins(self):
+        rng = np.random.default_rng(2)
+        samples = self._build_samples()
+        cmp = ComparatorIrregular(samples).compute_spectra(progress=False)
+        arrays = [rng.standard_normal((1, 4, 4)) for _ in samples]
+        with pytest.raises(ValueError, match="covariate features contain non-finite"):
+            cmp.normalize_covariates(arrays)
 
     def test_rejects_empty_covariate_sequence(self):
         samples = self._build_samples()

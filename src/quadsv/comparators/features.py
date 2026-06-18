@@ -37,6 +37,7 @@ __all__ = [
     "effective_rank",
     "gene_pattern_diversity",
     "power_spectrum_anisotropy",
+    "radial_bin_counts",
     "radial_bin_spectrum",
     "stream_radial_features",
     "stream_geomean_landmark",
@@ -494,17 +495,62 @@ def radial_bin_spectrum(
             f"expected ({ny}, {expected_kx}) for fft_solver='{fft_solver}'."
         )
 
+    # Compute the assignment of each FFT cell to a radial bin.
+    # When using rfft2, some FFT cells need to be double-counted (via weights2d).
+    # Bins with no FFT cells (counts == 0) will be assigned NA values downstream.
+    idx, weights2d, counts, n_bins = _radial_bin_index_and_counts(
+        grid_shape,
+        n_bins=n_bins,
+        fft_solver=fft_solver,
+        exclude_dc=exclude_dc,
+        spacing=spacing,
+        edges=edges,
+    )
+
+    leading = spectrum.shape[:-2]
+    flat = spectrum.reshape(-1, ny * expected_kx)  # (n_items, ny * n_kx)
+    if exclude_dc:
+        k = _radial_frequency_grid(ny, nx, fft_solver, spacing=spacing)
+        flat = flat[:, k.ravel() > 0.0]
+
+    # Accumulate radial power per FFT cells into their respective radial bins.
+    out = np.zeros((flat.shape[0], n_bins))
+    for b in range(flat.shape[0]):
+        np.add.at(out[b], idx, flat[b] * weights2d)
+    # Normalize the bin sums by the number of FFT cells in each bin.
+    nonempty = counts > 0
+    out[:, nonempty] /= counts[nonempty]  # bin-mean power
+    out[:, ~nonempty] = np.nan
+    return out.reshape(*leading, out.shape[-1])
+
+
+def _radial_bin_index_and_counts(
+    grid_shape: tuple[int, int],
+    *,
+    n_bins: int = 30,
+    fft_solver: str = "rfft2",
+    exclude_dc: bool = True,
+    spacing: tuple[float, float] | None = None,
+    edges: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Return flattened bin indices, FFT-cell weights, and per-bin counts."""
+    # Compute the radial frequency for each 2D FFT cell.
+    ny, nx = grid_shape
+    expected_kx = nx if fft_solver == "fft2" else nx // 2 + 1
     k = _radial_frequency_grid(ny, nx, fft_solver, spacing=spacing)
     k_max = float(k.max())
 
+    # Determine the bin edges
     if edges is None:
         # Edges include 0; right edge slightly past k_max so the last bin is closed.
+        # Each bin is equally spaced in frequency, but will contain different numbers of FFT cells.
         edges = np.linspace(0.0, k_max * (1.0 + 1e-9), n_bins + 1)
     else:
         edges = np.asarray(edges, dtype=float)
         if edges.ndim != 1 or edges.size < 2 or not np.all(np.diff(edges) > 0):
             raise ValueError("edges must be a 1D monotonically increasing array of length >= 2.")
         n_bins = len(edges) - 1
+
     # Bin index for each spectrum cell (0..n_bins-1).
     k_flat = k.ravel()
     idx = np.clip(np.digitize(k_flat, edges) - 1, 0, n_bins - 1)
@@ -517,7 +563,7 @@ def radial_bin_spectrum(
         col_weights[0] = 1.0
         if nx % 2 == 0:
             col_weights[-1] = 1.0
-        weights2d = np.broadcast_to(col_weights, (ny, expected_kx)).ravel()
+        weights2d = np.broadcast_to(col_weights, (ny, expected_kx)).ravel()  # flattened
     else:
         weights2d = np.ones(ny * expected_kx)
 
@@ -528,18 +574,36 @@ def radial_bin_spectrum(
         idx = idx[keep]
         weights2d = weights2d[keep]
 
-    leading = spectrum.shape[:-2]
-    flat = spectrum.reshape(-1, ny * expected_kx)  # (n_items, ny * n_kx)
-    if exclude_dc:
-        flat = flat[:, keep]
-    out = np.zeros((flat.shape[0], n_bins))
+    # Count the number of FFT cells in each bin.
     counts = np.zeros(n_bins)
     np.add.at(counts, idx, weights2d)
-    counts[counts == 0] = 1.0  # avoid div-by-zero on empty bins
-    for b in range(flat.shape[0]):
-        np.add.at(out[b], idx, flat[b] * weights2d)
-    out /= counts  # bin-mean power
-    return out.reshape(*leading, out.shape[-1])
+
+    return idx, weights2d, counts, n_bins
+
+
+def radial_bin_counts(
+    grid_shape: tuple[int, int],
+    n_bins: int = 30,
+    fft_solver: str = "rfft2",
+    exclude_dc: bool = True,
+    spacing: tuple[float, float] | None = None,
+    edges: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return FFT-cell counts for each radial frequency bin.
+
+    Counts are independent of the gene expression values. A zero count means
+    the sample's Fourier grid has no cells in that bin, so a corresponding
+    :func:`radial_bin_spectrum` entry is NaN rather than a measured zero-power
+    feature.
+    """
+    return _radial_bin_index_and_counts(
+        grid_shape,
+        n_bins=n_bins,
+        fft_solver=fft_solver,
+        exclude_dc=exclude_dc,
+        spacing=spacing,
+        edges=edges,
+    )[2]
 
 
 def stream_radial_features(
@@ -548,10 +612,9 @@ def stream_radial_features(
     grid_shape: tuple[int, int],
     *,
     chunk_size: int,
-    n_bins: int,
     fft_solver: str,
     spacing: tuple[float, float] | None,
-    edges: np.ndarray | None,
+    edges: np.ndarray,
     pbar: Any = None,
 ) -> np.ndarray:
     """Stream a sample's spectrum gene-chunk-by-gene-chunk into radial features.
@@ -572,8 +635,12 @@ def stream_radial_features(
         ``(ny, nx)`` of the rasterized image.
     chunk_size : int
         Genes per chunk.
-    n_bins, fft_solver, spacing, edges
+    fft_solver, spacing
         Forwarded to :func:`radial_bin_spectrum`.
+    edges : np.ndarray
+        Explicit shared radial bin edges. This streamed helper is intended for
+        comparator paths where cross-sample binning has already been resolved;
+        use :func:`radial_bin_spectrum` directly for ``n_bins``-based binning.
     pbar : tqdm, optional
         Progress bar; ``.update(1)`` is called once per chunk.
 
@@ -582,6 +649,9 @@ def stream_radial_features(
     np.ndarray
         Radial features of shape ``(n_genes, n_feature_bins)``.
     """
+    if edges is None:
+        raise ValueError("stream_radial_features requires explicit radial bin edges.")
+
     parts: list[np.ndarray] = []
     for start in range(0, n_genes, chunk_size):
         stop = min(start + chunk_size, n_genes)
@@ -590,7 +660,6 @@ def stream_radial_features(
             radial_bin_spectrum(
                 spec_chunk,
                 grid_shape=grid_shape,
-                n_bins=n_bins,
                 fft_solver=fft_solver,
                 spacing=spacing,
                 edges=edges,

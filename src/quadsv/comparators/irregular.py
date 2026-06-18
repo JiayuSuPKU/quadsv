@@ -99,6 +99,15 @@ class ComparatorIrregular(_ComparatorBase):
         ``n_radial_bins`` radial columns. In ``feature_mode='2d'``, the number
         of radius bins is ``len(freq_edges) - 1`` and the feature axis has
         ``(len(freq_edges) - 1) * n_theta_bins`` columns.
+    adaptive_freq_edges : bool, default False
+        If True, collapse radial bins that are empty for any sample's Fourier
+        grid by merging each empty bin into its right neighbour. Otherwise,
+        empty bins will be dropped across all samples. Regardless of the setting,
+        the retained final bins will always have support in every sample.
+        The fitted comparator records per-sample bin occupancy for the original
+        requested grid in ``frequency_bin_counts_``,
+        the pre-adaptation edge grid in ``freq_edges_requested_``, and
+        feature-axis-aligned intervals in ``frequency_bin_intervals_``.
     eps : float, default 1e-6
         NUFFT tolerance.
     presence_threshold : float, default 0.0
@@ -139,6 +148,7 @@ class ComparatorIrregular(_ComparatorBase):
         grid_shape: tuple[int, int] | Sequence[tuple[int, int]] | None = None,
         spacing: tuple[float, float] | Sequence[tuple[float, float]] | None = None,
         freq_edges: np.ndarray | None = None,
+        adaptive_freq_edges: bool = False,
         eps: float = 1e-6,
         presence_threshold: float = 0.0,
         nufft_chunk_size: int | str = "auto",
@@ -158,6 +168,8 @@ class ComparatorIrregular(_ComparatorBase):
         self.gene_names = list(resolved)
         self.feature_mode = feature_mode
         self.freq_edges = None if freq_edges is None else np.asarray(freq_edges, dtype=float)
+        self.freq_edges_requested_ = None if self.freq_edges is None else self.freq_edges.copy()
+        self._adaptive_freq_edges = bool(adaptive_freq_edges)
         # Private (internal-config) state.
         self._n_radial_bins = int(n_radial_bins)
         self._n_theta_bins = self._normalize_n_theta_bins(n_theta_bins)
@@ -313,7 +325,6 @@ class ComparatorIrregular(_ComparatorBase):
                 n_genes,
                 grid_i,
                 chunk_size=chunk_size,
-                n_bins=self._n_radial_bins,
                 fft_solver=self._spectrum_fft_solver,
                 spacing=spacing_i,
                 # Shared edges were resolved at the top of this backend dispatcher.

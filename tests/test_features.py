@@ -529,7 +529,6 @@ class TestStreamingFeatureHelpers:
             n_genes=spec.shape[0],
             grid_shape=(10, 10),
             chunk_size=2,
-            n_bins=6,
             fft_solver="rfft2",
             spacing=(1.0, 1.0),
             edges=edges,

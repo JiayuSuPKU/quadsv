@@ -93,7 +93,6 @@ class ComparatorGrid(_ComparatorBase):
         In 2d mode the rotation is learned from a streamed cross-gene geometric-mean
         landmark by default, or from an explicit ``landmark_genes`` set passed
         to :meth:`compute_spectra`.
-
     spacing : (dy, dx) or sequence of (dy, dx), optional
         Physical pitch of one rasterised bin. ``rasterize_bins`` emits one
         pixel per bin, so this maps the pixel lattice to physical frequency
@@ -102,6 +101,15 @@ class ComparatorGrid(_ComparatorBase):
         per sample (length ``n_samples``) so that sections with different bin pitches
         still bin onto a common physical frequency grid.
         Defaults to ``(1.0, 1.0)`` (cycles per raster bin).
+    adaptive_freq_edges : bool, default False
+        If True, collapse radial bins that are empty for any sample's Fourier
+        grid by merging each empty bin into its right neighbour. Otherwise,
+        empty bins will be dropped across all samples. Regardless of the setting,
+        the retained final bins will always have support in every sample.
+        The fitted comparator records per-sample bin occupancy for the original
+        requested grid in ``frequency_bin_counts_``,
+        the pre-adaptation edge grid in ``freq_edges_requested_``, and
+        feature-axis-aligned intervals in ``frequency_bin_intervals_``.
 
     Other Parameters
     ----------------
@@ -136,6 +144,7 @@ class ComparatorGrid(_ComparatorBase):
         workers: int | None = None,
         spacing: tuple[float, float] | Sequence[tuple[float, float]] | None = None,
         freq_edges: np.ndarray | None = None,
+        adaptive_freq_edges: bool = False,
         presence_threshold: float = 0.0,
         fft_chunk_size: int | str = "auto",
     ) -> None:
@@ -155,6 +164,8 @@ class ComparatorGrid(_ComparatorBase):
         self.gene_names = list(resolved)
         self.feature_mode = feature_mode
         self.freq_edges = None if freq_edges is None else np.asarray(freq_edges, dtype=float)
+        self.freq_edges_requested_ = None if self.freq_edges is None else self.freq_edges.copy()
+        self._adaptive_freq_edges = bool(adaptive_freq_edges)
         # Private (internal-config) state.
         self._n_radial_bins = int(n_radial_bins)
         self._n_theta_bins = self._normalize_n_theta_bins(n_theta_bins)
@@ -267,7 +278,8 @@ class ComparatorGrid(_ComparatorBase):
         chunk). The full ``(n_genes, ny, nx)`` raster / 2D spectra are never held
         in either mode (see :meth:`_ComparatorBase._compute_spectra`).
         """
-        # Resolve the spacing for each sample and define the shared frequency edges.
+        # Resolve spacing and cheap raster shapes before defining/adapting the
+        # shared frequency edges; adaptive bin merging needs both.
         n_samples = len(self.samples)
         spacings = (
             self._spacing_override
@@ -275,13 +287,14 @@ class ComparatorGrid(_ComparatorBase):
             else [(1.0, 1.0)] * n_samples
         )
         self._spacings = list(spacings)
+        shapes = [tuple(self._rasterize_one(s).shape[-2:]) for s in self.samples]
+        self._grid_shapes = [(int(ny), int(nx)) for ny, nx in shapes]
         self._resolve_freq_edges()
 
         # Resolve 'auto' chunk size. The lazy rasters carry their (ny, nx) as
         # cheap dask metadata, so we can scan shapes without materialising any
         # pixels, then size the chunk to bound the per-chunk dense footprint.
         if self._fft_chunk_size_spec == "auto":
-            shapes = [tuple(self._rasterize_one(s).shape[-2:]) for s in self.samples]
             self._fft_chunk_size = self._resolve_chunk_size("auto", shapes, n_jobs=n_jobs)
             logger.info(
                 "auto fft_chunk_size=%d (max lattice %d px, cap %d, budget %.1f GiB).",
@@ -326,7 +339,6 @@ class ComparatorGrid(_ComparatorBase):
                 n_genes,
                 (ny, nx),
                 chunk_size=chunk,
-                n_bins=self._n_radial_bins,
                 fft_solver=self._spectrum_fft_solver,
                 spacing=spacings[i],
                 edges=self.freq_edges,

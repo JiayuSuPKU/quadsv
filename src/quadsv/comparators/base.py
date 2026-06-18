@@ -47,6 +47,7 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources
 
 from quadsv.comparators.features import (
     compute_sample_spectrum,
+    radial_bin_counts,
     radial_bin_spectrum,
     stream_polar_features,
 )
@@ -186,6 +187,19 @@ class _ComparatorBase:
     rotation_angles_ : np.ndarray | None
         Per-sample rotation angle (degrees) applied during
         rotation-alignment. Populated only when ``feature_mode='2d'``.
+    freq_edges_requested_ : np.ndarray | None
+        The original auto-resolved or requested 1-D edge grid before adaptive
+        merging and support filtering. This is for reference purposes only.
+    frequency_bin_intervals_ : np.ndarray | None
+        The final radial frequency intervals of shape ``(n_retained_radius_bins, 2)``.
+        It is stored as intervals because after dropping empty bins the
+        edges may not be contiguous.
+    frequency_bin_counts_ : np.ndarray | None
+        Number of FFT-cell counts for each sample and originally requested radial
+        frequency bin, shape ``(n_samples, len(freq_edges_requested_) - 1)``.
+        These counts diagnose requested-bin support and distinguish empty
+        Fourier-grid intervals from true zero-power measurements in
+        :attr:`spectra_`.
 
     Private state (set by subclasses; not part of the user API)
     -----------------------------------------------------------
@@ -215,6 +229,10 @@ class _ComparatorBase:
     dc_: np.ndarray | None = None
     presence_: np.ndarray | None = None
     rotation_angles_: np.ndarray | None = None
+    frequency_bin_counts_: np.ndarray | None = None
+    freq_edges_requested_: np.ndarray | None = None
+    frequency_bin_intervals_: np.ndarray | None = None
+    _supported_frequency_bin_mask: np.ndarray | None = None
 
     _raw_2d_spectra: list[np.ndarray] | None = None
 
@@ -398,19 +416,163 @@ class _ComparatorBase:
         Idempotent and a no-op when ``freq_edges`` is already set or cannot yet
         be derived.
         """
-        if self.freq_edges is not None or not self._spacings:
+        if not self._spacings:
             return
 
-        # Find the minimum Nyquist frequency across all samples.
-        nyquists = [1.0 / (2.0 * max(dy, dx)) for (dy, dx) in self._spacings]
-        f_max = float(min(nyquists))
-        # Create the shared frequency edges.
-        self.freq_edges = np.linspace(0.0, f_max * (1.0 + 1e-9), self._n_radial_bins + 1)
-        logger.info(
-            "Auto-generated %d radial bins on [0, %.4g] cycles per unit length.",
-            self._n_radial_bins,
-            f_max,
+        # Request linearly spaced frequency edges if no explicit edges are provided.
+        if self.freq_edges is None:
+            # Find the minimum Nyquist frequency across all samples.
+            nyquists = [1.0 / (2.0 * max(dy, dx)) for (dy, dx) in self._spacings]
+            f_max = float(min(nyquists))
+            # Create the shared frequency edges.
+            self.freq_edges = np.linspace(0.0, f_max * (1.0 + 1e-9), self._n_radial_bins + 1)
+            logger.info(
+                "Auto-generated %d radial bins on [0, %.4g] cycles per unit length.",
+                self._n_radial_bins,
+                f_max,
+            )
+
+        # For diagnostic purposes, keep a copy of the requested frequency edges.
+        if self.freq_edges_requested_ is None and self.freq_edges is not None:
+            self.freq_edges_requested_ = np.asarray(self.freq_edges, dtype=float).copy()
+
+        # Optionally, merge empty radial bins to ensure bins are supported in all samples.
+        if getattr(self, "_adaptive_freq_edges", False):
+            self._adapt_freq_edges()
+
+    def _fft_cell_counts_for_edges(self, edges: np.ndarray | None = None) -> np.ndarray | None:
+        """Return per-sample FFT-cell counts for a radial-frequency edge grid."""
+        if edges is None:
+            edges = self.freq_edges
+        if edges is None or not self._grid_shapes or not self._spacings:
+            return None
+        return np.vstack(
+            [
+                radial_bin_counts(
+                    shape,
+                    n_bins=self._n_radial_bins,
+                    fft_solver=self._spectrum_fft_solver,
+                    spacing=spacing,
+                    edges=edges,
+                )
+                for shape, spacing in zip(self._grid_shapes, self._spacings, strict=True)
+            ]
         )
+
+    def _adapt_freq_edges(self) -> None:
+        """Merge adjacent radial bins until every retained bin has sample support."""
+        if self.freq_edges is None:
+            return
+        if not self._grid_shapes or not self._spacings:
+            return
+
+        # Compute number of FFT-cells in each radial bin from the current edges.
+        edges = np.asarray(self.freq_edges, dtype=float)
+        requested = edges.size - 1
+        feature_grid_counts = self._fft_cell_counts_for_edges(edges)
+        if feature_grid_counts is None:
+            return
+
+        # Accumulate adjacent original bins until all samples have at least one
+        # FFT cell in the merged interval. This is equivalent to repeatedly
+        # merging unsupported bins, but avoids recomputing per-sample histograms
+        # after every edge deletion.
+        merged_edges = [float(edges[0])]
+        running = np.zeros(feature_grid_counts.shape[0], dtype=float)
+        for bin_idx in range(requested):
+            running += feature_grid_counts[:, bin_idx]
+            if np.all(running > 0):
+                merged_edges.append(float(edges[bin_idx + 1]))
+                running.fill(0.0)
+
+        if len(merged_edges) == 1:
+            merged_edges.append(float(edges[-1]))
+        elif merged_edges[-1] != float(edges[-1]):
+            # Trailing unsupported bins have no right neighbour, so merge them
+            # into the final retained interval by extending its right edge.
+            merged_edges[-1] = float(edges[-1])
+
+        # Update the frequency edges and the number of radial bins.
+        self.freq_edges = np.asarray(merged_edges, dtype=float)
+        self._n_radial_bins = int(self.freq_edges.size - 1)
+        collapsed = requested - self._n_radial_bins
+        if collapsed:
+            logger.info(
+                "Adaptive frequency edges collapsed %d empty radial bins "
+                "(requested=%d, actual=%d).",
+                collapsed,
+                requested,
+                self._n_radial_bins,
+            )
+
+    def _select_supported_frequency_bins(
+        self, features: np.ndarray, supported_bins: np.ndarray
+    ) -> np.ndarray:
+        """Subset radial or 2D polar feature arrays to retained radial bins."""
+        if supported_bins.all():
+            return features
+        supported_bins = np.asarray(supported_bins, dtype=bool)
+        n_radius = supported_bins.size
+        if self.feature_mode == "radial":
+            if features.shape[-1] != n_radius:
+                raise ValueError(
+                    f"radial feature axis has length {features.shape[-1]}, "
+                    f"expected {n_radius} bins before support filtering"
+                )
+            return features[..., supported_bins]
+
+        # In 2D mode, drop whole angular blocks for unsupported radial bins.
+        n_theta = self._n_theta_bins
+        expected = n_radius * n_theta
+        if features.shape[-1] != expected:
+            raise ValueError(
+                f"2D feature axis has length {features.shape[-1]}, "
+                f"expected {expected} = {n_radius} radial bins x {n_theta} angles"
+            )
+        reshaped = features.reshape(*features.shape[:-1], n_radius, n_theta)
+        kept = reshaped[..., supported_bins, :]
+        return kept.reshape(*features.shape[:-1], int(supported_bins.sum()) * n_theta)
+
+    def _record_frequency_bin_metadata(
+        self,
+        feature_grid_counts: np.ndarray | None,
+        requested_grid_counts: np.ndarray | None,
+    ) -> np.ndarray | None:
+        """Record bin diagnostics and return the feature-grid support mask."""
+        if feature_grid_counts is None:
+            self.frequency_bin_counts_ = None  # 1D
+            self.frequency_bin_intervals_ = None  # 2D, (start, end) per retained bin
+            self._supported_frequency_bin_mask = None  # 1D
+            return None
+
+        # Identify frequency bins in the current grid that are supported by all samples.
+        supported_bins = (feature_grid_counts > 0).all(axis=0)
+        if not np.any(supported_bins):
+            raise RuntimeError("No radial frequency bins are supported by every sample.")
+
+        self._supported_frequency_bin_mask = supported_bins.copy()
+        self.frequency_bin_counts_ = (
+            requested_grid_counts if requested_grid_counts is not None else feature_grid_counts
+        )
+
+        # Record the start and end of each retained frequency bin.
+        if self.freq_edges is not None:
+            intervals = np.column_stack(
+                [np.asarray(self.freq_edges[:-1]), np.asarray(self.freq_edges[1:])]
+            )
+            self.frequency_bin_intervals_ = intervals[supported_bins]
+        else:
+            self.frequency_bin_intervals_ = None
+
+        dropped = int((~supported_bins).sum())
+        if dropped:
+            logger.info(
+                "Dropped %d radial bins with missing sample support " "(retained=%d).",
+                dropped,
+                int(supported_bins.sum()),
+            )
+        self._n_radial_bins = int(supported_bins.sum())
+        return supported_bins
 
     # ------------------------------------------------------------------
     def compute_spectra(
@@ -458,7 +620,20 @@ class _ComparatorBase:
             n_jobs=n_jobs, progress=progress, landmark_genes=landmark_genes
         )
 
+        # The feature grid may be adaptively merged; diagnostics also preserve
+        # support on the originally requested grid.
+        feature_grid_counts = self._fft_cell_counts_for_edges(self.freq_edges)
+        requested_grid_counts = self._fft_cell_counts_for_edges(self.freq_edges_requested_)
+        supported_bins = self._record_frequency_bin_metadata(
+            feature_grid_counts,
+            requested_grid_counts,
+        )
+
+        # self._compute_spectra returns the raw features with potential NA values.
+        # Keep only features in the supported frequency bins.
         feats = list(per_sample)
+        if supported_bins is not None:
+            feats = [self._select_supported_frequency_bins(f, supported_bins) for f in feats]
         n_feature_bins = min(f.shape[-1] for f in feats)
         feats = [f[..., :n_feature_bins] for f in feats]
         self.spectra_ = np.stack(feats, axis=0)
@@ -491,6 +666,12 @@ class _ComparatorBase:
         sub.dc_ = None if self.dc_ is None else self.dc_[idx]
         sub.presence_ = None if self.presence_ is None else self.presence_[idx]
         sub.rotation_angles_ = None if self.rotation_angles_ is None else self.rotation_angles_[idx]
+        sub.frequency_bin_counts_ = (
+            None if self.frequency_bin_counts_ is None else self.frequency_bin_counts_[idx]
+        )
+        sub.freq_edges_requested_ = self.freq_edges_requested_
+        sub.frequency_bin_intervals_ = self.frequency_bin_intervals_
+        sub._supported_frequency_bin_mask = self._supported_frequency_bin_mask
         if self._spacings is not None and len(self._spacings) == len(self.samples):
             sub._spacings = [self._spacings[i] for i in idx]
         if self._grid_shapes and len(self._grid_shapes) == len(self.samples):
@@ -532,7 +713,8 @@ class _ComparatorBase:
           one ``(n_covariates, ny_i, nx_i)`` array per sample. Universal
           path; works on either subclass. Use when you want full control
           over rasterization, or when the covariates aren't already
-          attached to the sample containers.
+          attached to the sample containers. These rasters must have
+          frequency support compatible with the comparator's retained bins.
 
         Both modes produce the same downstream behaviour: per-sample
         covariate features are reduced to ``(n_covariates, n_feature_bins)``
@@ -566,6 +748,7 @@ class _ComparatorBase:
                     "of per-sample (n_cov, ny, nx) arrays."
                 )
             cov_features_per_sample = self._covariate_features_from_keys(items)
+            covariate_mode = "key"
         elif isinstance(first, np.ndarray):
             if len(items) != len(self.samples):
                 raise ValueError(
@@ -575,6 +758,7 @@ class _ComparatorBase:
                 self._covariate_features_from_array(arr, sample_index=i)
                 for i, arr in enumerate(items)
             ]
+            covariate_mode = "array"
         else:
             raise TypeError(
                 f"covariates[0] is {type(first).__name__}; expected str (column-name "
@@ -587,9 +771,37 @@ class _ComparatorBase:
                 f"sets but the comparator has {len(self.samples)} samples."
             )
         for i, cov_feat in enumerate(cov_features_per_sample):
+            if self._supported_frequency_bin_mask is not None:
+                # Keep only the frequency bins that are supported by all samples.
+                cov_feat = self._select_supported_frequency_bins(
+                    cov_feat,
+                    self._supported_frequency_bin_mask,
+                )
             cov_feat = cov_feat[..., : self.spectra_.shape[-1]]
+            self._validate_covariate_features(cov_feat, sample_index=i, mode=covariate_mode)
             self.spectra_[i] = _normalize_covariates(self.spectra_[i], cov_feat)
         return self
+
+    def _validate_covariate_features(
+        self, cov_feat: np.ndarray, *, sample_index: int, mode: str
+    ) -> None:
+        """Validate per-sample covariate features before log-space regression."""
+        if self.spectra_ is None:
+            raise RuntimeError("Call .compute_spectra() before .normalize_covariates().")
+        if cov_feat.shape[-1] != self.spectra_.shape[-1]:
+            raise ValueError(
+                f"sample {sample_index} covariate features have {cov_feat.shape[-1]} "
+                f"bins after frequency-bin filtering, expected {self.spectra_.shape[-1]}."
+            )
+        if not np.isfinite(cov_feat).all():
+            mode_label = "pre-rasterized array" if mode == "array" else "key-based"
+            raise ValueError(
+                f"sample {sample_index} {mode_label} covariate features contain "
+                "non-finite values after frequency-bin filtering. This usually means "
+                "the covariate grid lacks Fourier support for at least one retained "
+                "bin; use covariates on a compatible grid, reduce n_radial_bins, or "
+                "enable adaptive_freq_edges."
+            )
 
     # ------------------------------------------------------------------
     def _covariate_features_from_array(self, cov: np.ndarray, sample_index: int) -> np.ndarray:
